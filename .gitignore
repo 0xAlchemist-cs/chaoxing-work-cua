@@ -1,0 +1,4 @@
+.mimosa/
+node_modules/
+*.tgz
+test-install/
