@@ -259,6 +259,96 @@ scroll_amount = round((元素当前y - 期望y) / pxPerNotch)
 3. 每份作业独立验收完毕再切下一份；全部完成后统一汇报作答内容，**等用户明确说
    "提交"再提交**。
 
+## 内置浏览器高效模式（browser-use / IAB，推荐）
+
+配合 ZCode 内置浏览器（control-browser skill）时，可以**直接读写 DOM**：domSnapshot 读题、
+locator 点击/填写，彻底绕开 CUA 模式的坐标校准、截图超时、字体加密猜测等难题，
+速度快一个数量级。本章是实测后的完整打法。
+
+### 接管用户已登录的页面
+
+- 用户自己登录并打开课程页后：先 `browser.tabs.list()`；为空或不匹配时用
+  `browser.user.openTabs()` 找到目标页 → `browser.user.claimTab(info)` 接管。
+- **接管后立即 `await tab.markHandoff()`**：未标记的 claimed 标签会在对话轮次结束时被
+  释放回用户侧，下一轮调用会报 `Browser tab ... is unavailable`，需重新 claim。
+- 报 unavailable 的标准处理：重新 `tabs.list()` + `user.openTabs()` 枚举，再 claim。
+
+### 学习通课程页结构（mooc2-ans/mycourse/stu）
+
+- 顶部导航在主文档：AI助教 / 任务 / 章节 / 讨论 / 作业 / 考试…，全是 javascript: 链接，
+  点击后由 iframe 加载对应内容。
+- **iframe 的 id 随顶部标签切换**：章节=`frame_content-zj`，作业=`frame_content`，
+  任务=`frame_content-hd`。每切一次标签，frameLocator 的 id 也要跟着换。
+- 课程的测验任务都在章节里（作业标签可能为空）。章节菜单里带"N个待完成任务点"
+  标记的小节就是待答题任务；全部做完后菜单内该标记清零，任务点进度 +1
+  （如 39/94 → 40/94）。
+
+### 打开指定小节（菜单点击点不动的可靠替代）
+
+章节菜单的可见行被上层 `<a>` 覆盖，Playwright 点击会报
+`covered by <a>`；强制点击/回车/JS 直点隐藏模板均无效。可靠路径：
+
+1. 题号项的父级 `chapter_item` 元素带 onclick：`toOld('courseid','knowledgeid','clazzid',0)`。
+   `getAttribute("onclick")` 查询通道可正常读取 → 提取 knowledgeid。
+2. 先导航顶层标签到
+   `studentcourse?courseid=..&clazzid=..&knowledgeid=<id>&cpi=..&ut=s` 让主文档与
+   课程框架**同源化**（此后 evaluate/点击都可用）。
+3. 同源后直接点击 `#cur<knowledgeid>`（chapter_item），页面跳转到 studentstudy
+   知识卡片页（URL 形如 `mycourse/studentstudy?chapterId=<knowledgeid>&enc=..`）。
+4. `goto()` 遇到学习通多重重定向会超时报错——**超时 ≠ 失败**，读 url()/title() 确认即可。
+
+### 知识卡片页（studentstudy）作答
+
+- 任务点以 `option` 角色分组（视频 / 章节测验），点击"章节测验"option 切换到测验。
+- **测验嵌在三层 iframe 里**：主文档 → `iframe(knowledge/cards)` →
+  `iframe[src*="ananas/modules/work"]` → `iframe#frame_content(doHomeWorkNew)`。
+  用链式 frameLocator 穿透：
+
+  ```js
+  const quiz = tab.playwright
+    .frameLocator('iframe#iframe')
+    .frameLocator('iframe[src*="ananas/modules/work"]')
+    .frameLocator('iframe#frame_content');
+  ```
+
+- **题干有字体加密**（读出来是乱码），但选项是明文；结合章节名可推断题目——**推断有
+  风险：多选题全对才给分，且提交后不能重做**（实测猜 ABCD 错了记 0 分）。提交前用
+  "选项明文 + 章节名"联网检索题库核实。
+- 选项元素是 `<li>`（无 input），被覆盖 `<a>` 挡住 → locator click 报 covered。
+- **同源 JS 直点方案**：当主文档与整条 iframe 链同源（都在 mooc1.chaoxing.com）时，
+  用主文档 evaluate 穿透 window.frames 直接触发选项的 DOM click：
+
+  ```js
+  // frames 索引 ≠ DOM 顺序，先递归扫描 window.frames 树按 href 找到测验层
+  const qdoc = window.frames[4].frames[0].frames[0].document; // 实测路径
+  qdoc.querySelectorAll('a').forEach(a => {
+    const t = (a.innerText || '').replace(/\s+/g, '');
+    if (/选项关键词/.test(t)) a.click();
+  });
+  ```
+
+- 提交：测验框内点"提交"后，确认弹窗在**主文档** `.popBottom`（含 提交/取消）→
+  在主文档对该弹窗内的"提交"按钮执行 JS click。
+- 验证：测验框文本出现「已完成 / 第N次作答 / 本次成绩X分 / 我的答案」即提交成功。
+
+### 判分、错题与正确答案
+
+- 多选题全对才给分；提交后**不能重做**——拿不准就先核实再提交。
+- 提交后点「AI讲解」打开 AI 助教侧边栏（`iframe#cozeIframe`，跨域），用
+  `frameLocator("#cozeIframe").locator("body").innerText()` 可读完整解析与**正确答案**
+  （供记录，无法改分）。
+- 批改标记读不到 class 时，AI讲解是最可靠的答案来源。
+
+### IAB 已知限制
+
+- 重页面（带视频/大量动画）截图会持续报
+  `screenshot surface preparation timed out after 3000ms` → 改用 innerText /
+  getAttribute 查询通道做验证，不要反复重试截图。
+- **跨域 iframe 的 evaluate 完全不可靠**：执行可能不生效、返回值被吞（一律返回 `{}`）。
+  跨域框架内只依赖查询类方法（innerText / count / getAttribute）；
+  需要执行 JS 时先按上述方法把主文档同源化。
+- `dom_cua.get_visible_dom()` 不穿透 iframe（只返回主文档可见节点）。
+
 ## 提交前验收清单
 
 - [ ] 全部题目清单齐全（题量与页面标注一致）
