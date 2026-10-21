@@ -45,6 +45,24 @@ computer-use 插件）使用的 **Skill（技能指令文件）**。安装后，
 
 ## 📦 安装
 
+### 方式一：npx 一键安装（推荐）
+
+```bash
+npx chaoxing-work-cua
+```
+
+会自动把 SKILL.md 安装到已存在的 Agent 技能目录
+（按 `~/.agents/skills` → `~/.zcode/skills` → `~/.claude/skills` 顺序检测，
+都不存在时装到 `~/.agents/skills`）。
+
+指定安装位置：
+
+```bash
+npx chaoxing-work-cua --target "D:\my-agent\skills"
+```
+
+### 方式二：手动安装
+
 把 `SKILL.md` 放到你所用 Agent 的技能目录下，例如：
 
 ```text
