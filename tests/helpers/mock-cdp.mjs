@@ -88,11 +88,11 @@ export class MockCdpServer {
       if (len === 126) { if (this._buf.length < 4) return; len = this._buf.readUInt16BE(2); off = 4; }
       else if (len === 127) { if (this._buf.length < 10) return; len = Number(this._buf.readBigUInt64BE(2)); off = 10; }
       if (this._buf.length < off + (masked ? 4 : 0) + len) return;
+      const op = this._buf[0] & 0x0f; // 先取本帧 opcode，再推进缓冲
       let payload = Buffer.from(this._buf.slice(off + (masked ? 4 : 0), off + (masked ? 4 : 0) + len));
       const mask = masked ? this._buf.slice(off, off + 4) : null;
       if (mask) for (let i = 0; i < payload.length; i++) payload[i] ^= mask[i & 3];
       this._buf = this._buf.slice(off + (masked ? 4 : 0) + len);
-      const op = this._buf[0] & 0x0f;
       if (op === 8) { socket.end(); return; }
       if (op === 9) { this._sendRawFrame(socket, payload, true, 0xA); continue; }
       try {

@@ -108,15 +108,19 @@ test("大消息分片：服务器分片发送的 64 位长度大消息必须完�
   await cdp.close();
 });
 
-test("事件队列上限：事件洪峰不得无限占用内存（drain 长度有界）", async () => {
+test("事件队列上限：事件洪峰不得无限占用内存（洪峰在订阅后触发，精确断言上限）", async () => {
   const { port, server } = await serverFor();
-  server.onConnection = (conn) => {
-    for (let i = 0; i < 1200; i++) conn.sendObj({ method: "Console.messageAdded", params: { i } });
+  server.onCommand = (m, conn) => {
+    if (m.method === "Page.enable") {
+      for (let i = 0; i < 1200; i++) conn.sendObj({ method: "Console.messageAdded", params: { i } });
+      return {}; // 洪峰之后回包
+    }
+    return {};
   };
   const cdp = await connect(port);
-  await new Promise(r => setTimeout(r, 300));
+  await cdp.send("Page.enable"); // 订阅已就绪，洪峰必然进入队列路径
   const events = cdp.drain();
-  assert.ok(events.length <= 600, `事件队列无界增长：${events.length}`);
+  assert.equal(events.length, 500, `事件队列应精确截断在 500，实际 ${events.length}`);
   await cdp.close();
 });
 
@@ -133,4 +137,28 @@ test("close 后 send：必须立即拒绝而非挂起或写入死连接", async 
   const cdp = await connect(port);
   await cdp.close();
   await assert.rejects(cdp.send("Page.enable"), /ECLOSED|closed/i);
+});
+
+test("协议违规：新数据帧打断未完成分片必须中止连接（EWS），不得静默截断消息", async () => {
+  const { port, server } = await serverFor();
+  server.onConnection = (conn) => {
+    conn.sendTextFrame(Buffer.from('{"method":"x","par'), { fin: false, opcode: 0x1 });
+    conn.sendTextFrame(Buffer.from('"partial"'), { fin: true, opcode: 0x0 }); // 正常完成
+    conn.sendTextFrame(Buffer.from('{"method":"y","par'), { fin: false, opcode: 0x1 });
+    conn.sendTextFrame(Buffer.from('{"method":"z"'), { fin: true, opcode: 0x1 }); // 新数据帧打断 → 违规
+  };
+  const cdp = await connect(port);
+  await assert.rejects(cdp.send("Page.enable"), /EWS|ECLOSED/i);
+});
+
+test("握手同包消息不丢失：与服务端 101 同批到达的事件必须在连接后可见", async () => {
+  const { port, server } = await serverFor();
+  server.onConnection = (conn) => {
+    conn.sendObj({ method: "Target.attachedToTarget", params: { hello: 1 } });
+  };
+  const cdp = await connect(port);
+  const events = cdp.drain();
+  assert.equal(events.length, 1, "握手同包事件被丢弃");
+  assert.equal(events[0].method, "Target.attachedToTarget");
+  await cdp.close();
 });

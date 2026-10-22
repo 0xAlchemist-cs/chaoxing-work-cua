@@ -129,12 +129,14 @@ function wsConnect(wsUrl) {
     let buf = Buffer.alloc(0), handshaken = false, closed = false;
     let fragments = null;                  // 分片重组缓冲 {chunks, bytes}
     const handlers = { message: [], close: [] };
+    const earlyMessages = [];              // 订阅前到达的消息（握手同包竞态），首次订阅时补投
     const failInit = (e) => { if (!handshaken) { try { sock.destroy(); } catch {} reject(e); } };
     const failConn = (e) => {              // 握手后的致命错误：通知 close 监听者（会拒绝所有 pending）
       if (!handshaken) return failInit(e);
       try { sock.destroy(); } catch {}
       closed = true;
-      handlers.close.forEach((f) => { try { f(); } catch {} });
+      const err = e instanceof Error ? e : new Error("ECLOSED: CDP 连接已断开");
+      handlers.close.forEach((f) => { try { f(err); } catch {} });
     };
     sock.on("error", (e) => failConn(new Error(`ECONN: ${e.message}`)));
     sock.on("data", (c) => {
@@ -153,10 +155,20 @@ function wsConnect(wsUrl) {
         sock.setTimeout(0); // 握手完成，交由上层 send 超时管理
         resolve({
           send: (obj) => sendFrame(JSON.stringify(obj)),
-          // 注册晚于关闭事件（同一批数据里既有握手又有致命帧的竞态）：立即补发回调
+          // 订阅晚于事件（同一批数据里既有握手又有后续帧的竞态）：close 立即补发，message 先缓存再补投
           on: (ev, fn) => {
-            if (ev === "close" && closed) { queueMicrotask(() => { try { fn(); } catch {} }); return; }
-            handlers[ev].push(fn);
+            if (ev === "close") {
+              if (closed) queueMicrotask(() => { try { fn(); } catch {} });
+              else handlers.close.push(fn);
+              return;
+            }
+            if (ev === "message") {
+              handlers.message.push(fn);
+              if (earlyMessages.length) {
+                const backlog = earlyMessages.splice(0);
+                queueMicrotask(() => backlog.forEach((t) => { try { fn(t); } catch {} }));
+              }
+            }
           },
           close: () => { closed = true; try { sock.end(); } catch {} },
         });
@@ -171,6 +183,7 @@ function wsConnect(wsUrl) {
         const fin = !!(b0 & 0x80), opcode = b0 & 0x0f;
         if (b0 & 0x70) return failConn(new Error("EWS: RSV 位被置位，非法帧"));   // rsv1-3
         let len = b1 & 0x7f, off = 2, masked = b1 & 0x80;
+        if (masked) return failConn(new Error("EWS: 服务端帧不允许带掩码（RFC 6455）"));
         if (len === 126) { if (buf.length < 4) return; len = buf.readUInt16BE(2); off = 4; }
         else if (len === 127) { if (buf.length < 10) return; len = Number(buf.readBigUInt64BE(2)); off = 10; }
         if (len > MAX_MESSAGE_BYTES) return failConn(new Error("EWS: 帧长度超过上限"));
@@ -187,21 +200,28 @@ function wsConnect(wsUrl) {
           continue;
         }
         if (opcode === 1 || opcode === 2) {                    // 文本/二进制
+          if (fragments) return failConn(new Error("EWS: 数据帧打断未完成的分片消息"));
           if (!fin) { fragments = { chunks: [payload], bytes: payload.length }; continue; }
           deliver(payload);
           continue;
         }
         if (opcode === 9) { sendFrameRaw(0x8a, payload); continue; }   // ping -> pong
+        if (opcode === 0xa) continue;                                  // 未请求的 pong：忽略（RFC 6455）
         if (opcode === 8) {                                    // close
           closed = true; try { sock.end(); } catch {}
           handlers.close.forEach((f) => { try { f(); } catch {} });
           return;
         }
-        return failConn(new Error(`EWS: 未处理的 opcode ${opcode}`));   // 0x3-0x7 / 0xA-0xF
+        return failConn(new Error(`EWS: 未处理的 opcode ${opcode}`));   // 0x3-0x7 / 0xB-0xF
       }
     }
     function deliver(payload) {
       const txt = payload.toString();
+      if (!handlers.message.length) {  // 尚无订阅者：缓存待补投（上限防洪）
+        earlyMessages.push(txt);
+        if (earlyMessages.length > MAX_EVENT_QUEUE) earlyMessages.shift();
+        return;
+      }
       handlers.message.forEach((f) => { try { f(txt); } catch {} });
     }
     function sendFrame(str) { sendFrameRaw(0x81, Buffer.from(str)); }
@@ -260,7 +280,7 @@ async function openConnection(target, opts = {}) {
       if (events.length > MAX_EVENT_QUEUE) events.splice(0, events.length - MAX_EVENT_QUEUE);
     }
   });
-  ws.on("close", () => failAll(new Error("ECLOSED: CDP 连接已断开")));
+  ws.on("close", (err) => failAll(err instanceof Error ? err : new Error("ECLOSED: CDP 连接已断开")));
   return {
     target,
     send(method, params = {}) {
@@ -279,10 +299,13 @@ async function openConnection(target, opts = {}) {
         catch (e) { clearTimeout(timer); pending.delete(id); reject(e); }
       });
     },
-    /** Runtime.evaluate 封装：页面抛出的异常透出为 EPAGEERR，正常时直接返回 value */
+    /**
+     * Runtime.evaluate 封装：页面抛出的异常透出为 EPAGEERR，正常时直接返回 value。
+     * 默认 returnByValue + awaitPromise（promise 表达式会等到解析值，非 promise 不受影响）。
+     */
     async evaluate(expression, evalOpts = {}) {
       const r = await this.send("Runtime.evaluate", {
-        expression, returnByValue: true, ...evalOpts,
+        expression, returnByValue: true, awaitPromise: true, ...evalOpts,
       });
       if (r && r.exceptionDetails) {
         const desc = r.exceptionDetails.exception?.description
