@@ -162,3 +162,21 @@ test("握手同包消息不丢失：与服务端 101 同批到达的事件必须
   assert.equal(events[0].method, "Target.attachedToTarget");
   await cdp.close();
 });
+
+// ---------- R5：连接建立阶段的断连不得永久等待 ----------
+
+test("HTTP 阶段断连：服务接受 TCP 后立即关闭（无响应头），连接必须报错而非挂起", { timeout: 4000 }, async () => {
+  const { port } = await serverFor({ dropHttp: true });
+  await assert.rejects(
+    connectCDP({ port, url: PAGE.url }),
+    /ECLOSED|ETIMEDOUT|ECONN/i,
+  );
+});
+
+test("WS 握手阶段断连：服务端在 101 前关闭连接，connectWsUrl 必须报错而非挂起", { timeout: 4000 }, async () => {
+  const { port } = await serverFor({ dropUpgrade: true });
+  await assert.rejects(
+    connectWsUrl(`ws://127.0.0.1:${port}/devtools/page/1`),
+    /ECLOSED|EHANDSHAKE|ECONN/i,
+  );
+});

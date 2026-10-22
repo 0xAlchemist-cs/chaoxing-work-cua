@@ -18,6 +18,8 @@ export class MockCdpServer {
     this.version = opts.version ?? { Browser: "Mock/1.0", webSocketDebuggerUrl: "ws://127.0.0.1:1/devtools/browser/x" };
     this.rejectUpgrade = opts.rejectUpgrade ?? false;
     this.badAccept = opts.badAccept ?? false;
+    this.dropHttp = opts.dropHttp ?? false;       // 注入：接受 TCP 连接后立即销毁（无任何响应）
+    this.dropUpgrade = opts.dropUpgrade ?? false; // 注入：收到升级请求后立即销毁（101 之前）
     // 可注入的命令处理器：(msg) => result | { error } ；抛异常/挂起均可注入
     this.onCommand = () => ({ ok: true });
     // 可注入的主动行为：conn => {...}，测试里用来主动关连接/发垃圾帧
@@ -35,7 +37,11 @@ export class MockCdpServer {
       if (req.url === "/json/list") return send(200, this.targets);
       send(404, { error: "not found" });
     });
+    this.server.on("connection", (socket) => {
+      if (this.dropHttp) socket.end(); // 干净 FIN（无 RST、无 error），专测"无响应头即关闭"
+    });
     this.server.on("upgrade", (req, socket) => {
+      if (this.dropUpgrade) return socket.destroy();
       if (this.rejectUpgrade) {
         socket.write("HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n");
         return socket.destroy();

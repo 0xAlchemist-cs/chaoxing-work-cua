@@ -39,9 +39,10 @@ function httpGetRaw(url) {
     const req = net.connect(+u.port, u.hostname, () => {
       req.write(`GET ${u.pathname} HTTP/1.1\r\nHost: ${u.hostname}:${u.port}\r\nConnection: close\r\n\r\n`);
     });
-    let buf = Buffer.alloc(0), headerDone = false, need = -1;
-    const finish = (val) => { try { req.destroy(); } catch {} resolve(val); };
-    req.setTimeout(8000, () => { req.destroy(); reject(new Error("ETIMEOUT-HTTP: /json 请求超时")); });
+    let buf = Buffer.alloc(0), headerDone = false, need = -1, settled = false;
+    const finish = (val) => { if (settled) return; settled = true; try { req.destroy(); } catch {} resolve(val); };
+    const fail = (e) => { if (settled) return; settled = true; try { req.destroy(); } catch {} reject(e); };
+    req.setTimeout(8000, () => fail(new Error("ETIMEOUT-HTTP: /json 请求超时")));
     req.on("data", (c) => {
       buf = Buffer.concat([buf, c]);
       if (!headerDone) {
@@ -57,8 +58,12 @@ function httpGetRaw(url) {
         if (body.length >= need) finish(body.slice(0, need).toString());
       }
     });
-    req.on("error", (e) => reject(e));
-    req.on("close", () => { if (headerDone) finish(buf.slice(buf.indexOf("\r\n\r\n") + 4).toString()); });
+    req.on("error", (e) => fail(e));
+    // 无响应头即关闭（干净 FIN、无 error）：必须拒绝，否则 Promise 永久 pending
+    req.on("close", () => {
+      if (headerDone) return finish(buf.slice(buf.indexOf("\r\n\r\n") + 4).toString());
+      fail(new Error("ECLOSED-HTTP: 连接在响应头到达前关闭"));
+    });
   });
 }
 
@@ -139,6 +144,11 @@ function wsConnect(wsUrl) {
       handlers.close.forEach((f) => { try { f(err); } catch {} });
     };
     sock.on("error", (e) => failConn(new Error(`ECONN: ${e.message}`)));
+    // 握手完成前连接被关闭（干净 FIN）：必须拒绝，否则 Promise 永久 pending
+    sock.on("close", () => {
+      if (!handshaken) return failInit(new Error("ECLOSED: 握手完成前连接被关闭"));
+      if (!closed) { closed = true; handlers.close.forEach((f) => { try { f(); } catch {} }); }
+    });
     sock.on("data", (c) => {
       buf = Buffer.concat([buf, c]);
       if (buf.length > MAX_MESSAGE_BYTES) return failConn(new Error("EWS: 缓冲区超过消息上限"));
@@ -175,7 +185,6 @@ function wsConnect(wsUrl) {
       }
       pump();
     });
-    sock.on("close", () => { if (handshaken && !closed) { closed = true; handlers.close.forEach((f) => { try { f(); } catch {} }); } });
     function pump() {
       for (;;) {
         if (buf.length < 2) return;
