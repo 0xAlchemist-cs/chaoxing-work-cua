@@ -1,7 +1,7 @@
 // R1：目标身份与操作权限 —— 身份选择部分
 // 暴露的缺陷：connectCDP 在 preferUrl 不匹配时静默回退到任意页面（对错页面操作）；
 // 子串匹配可被同前缀 URL 欺骗；未校验 wsUrl 主机。
-import { test } from "node:test";
+import { test, after as afterHook } from "node:test";
 import assert from "node:assert/strict";
 import { pathToFileURL } from "node:url";
 import { join } from "node:path";
@@ -70,14 +70,32 @@ test("selectTarget: 无任何可用目标抛 ENOTARGET", () => {
   assert.throws(() => selectTarget([], { url: "https://a.b/c" }), /ENOTARGET/);
 });
 
+test("selectTarget: 环回主机判定不可被域名技巧绕过（IPv4 变体归一化后本就是环回，应放行）", () => {
+  const at = (host) => [{
+    type: "page", id: "1", title: "作业作答",
+    url: "https://mooc1.chaoxing.com/work/dowork?workId=1",
+    webSocketDebuggerUrl: `ws://${host}:9222/devtools/page/1`,
+  }];
+  const pattern = { url: "https://mooc1.chaoxing.com/work/dowork?workId=1" };
+  // 必须拒绝：伪装域名 / IPv6 映射环回（合法书写需方括号）/ 带点尾缀
+  for (const host of ["127.0.0.1.evil.com", "[::ffff:127.0.0.1]", "[::ffff:7f00:1]", "localhost."]) {
+    assert.throws(() => selectTarget(at(host), pattern), /EHOST/, host);
+  }
+  // 必须放行：URL 规范化后确为环回（大小写归一、十六进制/十进制 IPv4 记法）
+  for (const host of ["LOCALHOST", "0x7f000001", "2130706433"]) {
+    const h = new URL(selectTarget(at(host), pattern).webSocketDebuggerUrl).hostname;
+    assert.ok(h === "127.0.0.1" || h === "localhost", `${host} -> ${h}`);
+  }
+});
+
 // ---------- 集成：连到模拟服务，验证连接的就是选中的那个目标 ----------
 const openServers = [];
-test.after?.(async () => { for (const s of openServers) await s.close(); });
+afterHook(async () => { for (const s of openServers) await s.close(); });
 
-test("connectCDP: 严格匹配后连接成功，且 evaluate 在所选页面上下文执行", async () => {
+test("connectCDP: 严格匹配后连接成功，且 evaluate 落在所选页面上下文（按 ws path 回显 pageId）", async () => {
   const { port, server } = await listenWithPages(PAGE(1, "111"), PAGE(2, "222"));
-  server.onCommand = (m) => m.method === "Runtime.evaluate"
-    ? { result: { value: m.params.expression === "1+1" ? 2 : null } }
+  server.onCommand = (m, conn) => m.method === "Runtime.evaluate"
+    ? { result: { value: conn.pageId } }   // 回显实际连接的页面 id，防"选A连B"
     : {};
   const cdp = await connectCDP({
     port,
@@ -85,7 +103,7 @@ test("connectCDP: 严格匹配后连接成功，且 evaluate 在所选页面上�
   });
   assert.equal(cdp.target.id, "2");
   const r = await cdp.send("Runtime.evaluate", { expression: "1+1", returnByValue: true });
-  assert.equal(r.result.value, 2);
+  assert.equal(r.result.value, "2", "连接到了错误的页面");
   await cdp.close();
 });
 

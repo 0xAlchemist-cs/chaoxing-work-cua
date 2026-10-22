@@ -572,8 +572,9 @@ const r = await cdp.send("Runtime.evaluate", { expression: "document.title", ret
 // 精确元素位置（无需截图猜坐标）
 `(()=>{const r=document.querySelector('#id').getBoundingClientRect();return{x:r.x,y:r.y,w:r.width,h:r.height}})()`
 
-// iframe：先 listTargets() 看 type==='iframe' 的目标；选中后用其
-// webSocketDebuggerUrl 走 connectWsUrl() 直连（connectWsUrl 同样只允许环回主机）。
+// iframe：先 listTargets()，再对目标列表跑 selectTarget(targets, {url, type:"iframe"})
+// 唯一确定后，用**选中目标**的 webSocketDebuggerUrl 走 connectWsUrl() 直连。
+// 禁止跳过 selectTarget 直接拿列表里第一个 wsUrl 连——那是身份校验旁路。
 ```
 
 - 需要看图验证时用 `Page.captureScreenshot`（可带 clip 截元素级区域），返回 base64，

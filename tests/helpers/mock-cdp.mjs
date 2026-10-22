@@ -46,7 +46,7 @@ export class MockCdpServer {
         "HTTP/1.1 101 Switching Protocols\r\n" +
         "Upgrade: websocket\r\nConnection: Upgrade\r\n" +
         `Sec-WebSocket-Accept: ${this.badAccept ? "definitely-wrong" : accept}\r\n\r\n`);
-      this._attachSocket(socket);
+      this._attachSocket(socket, req.url);
     });
   }
 
@@ -60,9 +60,11 @@ export class MockCdpServer {
     return new Promise((r) => this.server.close(() => r()));
   }
 
-  _attachSocket(socket) {
+  _attachSocket(socket, reqUrl) {
+    // /devtools/page/<id> → conn.pageId，供测试校验"连到的就是选中的目标"
+    const pageId = /\/devtools\/page\/([^/?]+)/.exec(reqUrl || "")?.[1] ?? null;
     const conn = {
-      socket,
+      socket, pageId,
       sendObj: (obj) => this._sendFrame(socket, Buffer.from(JSON.stringify(obj))),
       sendTextFrame: (payload, { fin = true, opcode = 0x1 } = {}) => this._sendRawFrame(socket, payload, fin, opcode),
       sendBytes: (buf) => socket.write(buf),
@@ -70,13 +72,13 @@ export class MockCdpServer {
     };
     this.connections.add(conn);
     socket.on("close", () => this.connections.delete(conn));
-    socket.on("data", (chunk) => this._pump(socket, chunk));
+    socket.on("data", (chunk) => this._pump(socket, chunk, conn));
     this.onConnection(conn);
   }
 
-  // 解析客户端（带掩码）帧；只取完整文本消息，回调 onCommand
+  // 解析客户端（带掩码）帧；只取完整文本消息，回调 onCommand(msg, conn)
   _buf = Buffer.alloc(0);
-  _pump(socket, chunk) {
+  _pump(socket, chunk, conn) {
     this._buf = Buffer.concat([this._buf, chunk]);
     for (;;) {
       if (this._buf.length < 2) return;
@@ -96,12 +98,10 @@ export class MockCdpServer {
       try {
         const msg = JSON.parse(payload.toString());
         this.received.push(msg);
-        Promise.resolve(this.onCommand(msg)).then((r) => {
-          if (r && !msg.id) return; // 事件推送（无 id）不回包
-          if (msg.id) {
-            if (r && r.__error) connReply(this, msg.id, undefined, r.__error);
-            else connReply(this, msg.id, r ?? {});
-          }
+        Promise.resolve(this.onCommand(msg, conn)).then((r) => {
+          if (!msg.id) return; // 事件推送（无 id）不回包
+          if (r && r.__error) connReply(this, msg.id, undefined, r.__error);
+          else connReply(this, msg.id, r ?? {});
         }).catch(() => {});
       } catch { /* 非 JSON 帧忽略 */ }
     }
