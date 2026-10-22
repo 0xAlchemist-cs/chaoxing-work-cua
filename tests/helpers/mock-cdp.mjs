@@ -71,6 +71,7 @@ export class MockCdpServer {
     const pageId = /\/devtools\/page\/([^/?]+)/.exec(reqUrl || "")?.[1] ?? null;
     const conn = {
       socket, pageId,
+      buf: Buffer.alloc(0),            // 每连接独立接收缓冲（多连接并发不串扰）
       sendObj: (obj) => this._sendFrame(socket, Buffer.from(JSON.stringify(obj))),
       sendTextFrame: (payload, { fin = true, opcode = 0x1 } = {}) => this._sendRawFrame(socket, payload, fin, opcode),
       sendBytes: (buf) => socket.write(buf),
@@ -78,36 +79,36 @@ export class MockCdpServer {
     };
     this.connections.add(conn);
     socket.on("close", () => this.connections.delete(conn));
-    socket.on("data", (chunk) => this._pump(socket, chunk, conn));
+    socket.on("data", (chunk) => this._pump(conn, chunk));
     this.onConnection(conn);
   }
 
-  // 解析客户端（带掩码）帧；只取完整文本消息，回调 onCommand(msg, conn)
-  _buf = Buffer.alloc(0);
-  _pump(socket, chunk, conn) {
-    this._buf = Buffer.concat([this._buf, chunk]);
+  // 解析客户端（带掩码）帧；只取完整文本消息，回调 onCommand(msg, conn)，应答回发请求方
+  _pump(conn, chunk) {
+    conn.buf = Buffer.concat([conn.buf, chunk]);
     for (;;) {
-      if (this._buf.length < 2) return;
-      const b1 = this._buf[1];
+      if (conn.buf.length < 2) return;
+      const b1 = conn.buf[1];
       const masked = !!(b1 & 0x80);
       let len = b1 & 0x7f, off = 2;
-      if (len === 126) { if (this._buf.length < 4) return; len = this._buf.readUInt16BE(2); off = 4; }
-      else if (len === 127) { if (this._buf.length < 10) return; len = Number(this._buf.readBigUInt64BE(2)); off = 10; }
-      if (this._buf.length < off + (masked ? 4 : 0) + len) return;
-      const op = this._buf[0] & 0x0f; // 先取本帧 opcode，再推进缓冲
-      let payload = Buffer.from(this._buf.slice(off + (masked ? 4 : 0), off + (masked ? 4 : 0) + len));
-      const mask = masked ? this._buf.slice(off, off + 4) : null;
+      if (len === 126) { if (conn.buf.length < 4) return; len = conn.buf.readUInt16BE(2); off = 4; }
+      else if (len === 127) { if (conn.buf.length < 10) return; len = Number(conn.buf.readBigUInt64BE(2)); off = 10; }
+      if (conn.buf.length < off + (masked ? 4 : 0) + len) return;
+      const op = conn.buf[0] & 0x0f; // 先取本帧 opcode，再推进缓冲
+      let payload = Buffer.from(conn.buf.slice(off + (masked ? 4 : 0), off + (masked ? 4 : 0) + len));
+      const mask = masked ? conn.buf.slice(off, off + 4) : null;
       if (mask) for (let i = 0; i < payload.length; i++) payload[i] ^= mask[i & 3];
-      this._buf = this._buf.slice(off + (masked ? 4 : 0) + len);
-      if (op === 8) { socket.end(); return; }
-      if (op === 9) { this._sendRawFrame(socket, payload, true, 0xA); continue; }
+      conn.buf = conn.buf.slice(off + (masked ? 4 : 0) + len);
+      if (op === 8) { conn.socket.end(); return; }
+      if (op === 9) { this._sendRawFrame(conn.socket, payload, true, 0xA); continue; }
       try {
         const msg = JSON.parse(payload.toString());
         this.received.push(msg);
         Promise.resolve(this.onCommand(msg, conn)).then((r) => {
           if (!msg.id) return; // 事件推送（无 id）不回包
-          if (r && r.__error) connReply(this, msg.id, undefined, r.__error);
-          else connReply(this, msg.id, r ?? {});
+          // 应答必须发给发起请求的那个连接（多连接并发时不得广播/错发）
+          if (r && r.__error) conn.sendObj({ id: msg.id, error: { message: r.__error } });
+          else conn.sendObj({ id: msg.id, result: r ?? {} });
         }).catch(() => {});
       } catch { /* 非 JSON 帧忽略 */ }
     }
@@ -125,18 +126,11 @@ export class MockCdpServer {
     }
     socket.write(Buffer.concat([Buffer.from(head), payload]));
   }
-  // 向活动连接按 id 回包
+  // 向全部活动连接广播：按 id 回包 / 推送事件（应答类测试优先用 onCommand，走请求方定向回包）
   reply(id, result, error) {
-    const c = [...this.connections][0];
-    if (c) c.sendObj(error ? { id, error } : { id, result });
+    for (const c of this.connections) c.sendObj(error ? { id, error: { message: error } } : { id, result });
   }
-  // 向活动连接推送事件
   emit(method, params) {
-    const c = [...this.connections][0];
-    if (c) c.sendObj({ method, params });
+    for (const c of this.connections) c.sendObj({ method, params });
   }
-}
-function connReply(server, id, result, error) {
-  const c = [...server.connections][0];
-  if (c) c.sendObj(error ? { id, error: { message: error } } : { id, result });
 }

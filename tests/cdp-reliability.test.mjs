@@ -163,6 +163,19 @@ test("握手同包消息不丢失：与服务端 101 同批到达的事件必须
   await cdp.close();
 });
 
+test("并发连接互不串扰：两个连接各自拿到自己页面的应答（回包必须发给请求方）", async () => {
+  const { port, server } = await serverFor();
+  server.onCommand = (m, conn) => ({ result: { value: conn.pageId } });
+  const [a, b] = await Promise.all([
+    connectWsUrl(`ws://127.0.0.1:${port}/devtools/page/AAA`),
+    connectWsUrl(`ws://127.0.0.1:${port}/devtools/page/BBB`),
+  ]);
+  const [va, vb] = await Promise.all([a.evaluate("1"), b.evaluate("2")]);
+  assert.equal(va, "AAA", "连接 A 收到了别的连接的应答（串扰）");
+  assert.equal(vb, "BBB", "连接 B 收到了别的连接的应答（串扰）");
+  await Promise.all([a.close(), b.close()]);
+});
+
 // ---------- R5：连接建立阶段的断连不得永久等待 ----------
 
 test("HTTP 阶段断连：服务接受 TCP 后立即关闭（无响应头），连接必须报错而非挂起", { timeout: 4000 }, async () => {
