@@ -6,6 +6,8 @@
  * 安全机制：
  *   - 必需文件（SKILL.md / cdp-client.mjs）缺失 → 立即失败，且失败发生在写入任何
  *     文件之前（先全量校验，后写入）。
+ *   - 安装采用「决策备份 → 暂存写入 → 原子换入」三段式；任一段失败整体回滚，
+ *     目标目录保持安装前状态（不出现新旧混合的半成品）。
  *   - 覆盖已存在的任何文件前一律备份为 <原名>.bak-<时间戳>。
  *   - 若目标 SKILL.md 不是本 skill（frontmatter 的 name 不是 chaoxing-work-cua）
  *     → 视为外来文件，默认跳过覆盖并提示；--force 才覆盖（覆盖前同样备份）。
@@ -77,43 +79,58 @@ const isOurs = (filePath) => {
   }
 };
 
-// ---- 第 2 步：逐目录安装（先备份决策，后写入）----
+// ---- 第 2 步：逐目录安装（决策备份 → 暂存 → 换入；任一步失败整体回滚）----
 console.log(`安装 ${SKILL_NAME} skill ...`);
 let hadError = false;
 let skippedSkillCount = 0;
 for (const t of targets) {
   const dir = path.join(t, SKILL_NAME);
+  const plan = srcFiles.map((s) => ({
+    ...s,
+    dest: path.join(dir, s.name),
+    staged: path.join(dir, `${s.name}.staged-${timestamp}`),
+  }));
+  let skipSkill = false;
+  const backups = [];   // 换入前已存在的文件 → {name, dest, bak}
+  const swapped = [];   // 已换入的 dest
   try {
     fs.mkdirSync(dir, { recursive: true });
 
-    const destSkill = path.join(dir, "SKILL.md");
-    let skillWritten = true;
-    if (fs.existsSync(destSkill)) {
-      if (!isOurs(destSkill) && !force) {
-        console.warn(`  ! 跳过 SKILL.md（外来文件保护）: ${destSkill} 确认要覆盖请使用 force 开关。`);
-        skillWritten = false;
-        skippedSkillCount++;
-      } else {
-        const bak = backup(destSkill);
-        console.log(`  ⧗ 已备份原 SKILL.md → ${path.basename(bak)}`);
-        fs.copyFileSync(srcFiles[0].path, destSkill);
+    // 决策 + 备份（此阶段不写任何目标文件）
+    if (fs.existsSync(plan[0].dest) && !isOurs(plan[0].dest) && !force) {
+      skipSkill = true;
+      skippedSkillCount++;
+      console.warn(`  ! 跳过 SKILL.md（外来文件保护）: ${plan[0].dest} 确认要覆盖请使用 force 开关。`);
+    }
+    for (const p of plan) {
+      if (p.name === "SKILL.md" && skipSkill) continue;
+      if (fs.existsSync(p.dest)) {
+        const bak = backup(p.dest);
+        backups.push({ name: p.name, dest: p.dest, bak });
+        console.log(`  ⧗ 已备份原 ${p.name} → ${path.basename(bak)}`);
       }
-    } else {
-      fs.copyFileSync(srcFiles[0].path, destSkill);
     }
 
-    // 其余必需文件（cdp-client.mjs）无条件安装；覆盖前同样备份
-    for (const s of srcFiles.slice(1)) {
-      const dest = path.join(dir, s.name);
-      if (fs.existsSync(dest)) {
-        const bak = backup(dest);
-        console.log(`  ⧗ 已备份原 ${s.name} → ${path.basename(bak)}`);
-      }
-      fs.copyFileSync(s.path, dest);
+    // 暂存写入（失败在此阶段发生时目标文件尚未被动过）
+    for (const p of plan) {
+      if (p.name === "SKILL.md" && skipSkill) continue;
+      fs.copyFileSync(p.path, p.staged);
     }
-    console.log(skillWritten ? `  ✓ ${dir}` : `  ◐ ${dir}（SKILL.md 因外来文件保护未覆盖，其余文件已安装）`);
+    // 换入（rename 原子替换）
+    for (const p of plan) {
+      if (p.name === "SKILL.md" && skipSkill) continue;
+      fs.renameSync(p.staged, p.dest);
+      swapped.push(p.dest);
+    }
+    console.log(skipSkill ? `  ◐ ${dir}（SKILL.md 因外来文件保护未覆盖，其余文件已安装）` : `  ✓ ${dir}`);
   } catch (e) {
-    console.error(`  ✗ ${dir} : ${e.message}`);
+    // 整体回滚：有备份的恢复备份；无备份但已换入的删除；清理暂存
+    for (const b of backups) { try { fs.copyFileSync(b.bak, b.dest); } catch {} }
+    for (const dest of swapped) {
+      if (!backups.some((b) => b.dest === dest)) { try { fs.rmSync(dest, { force: true }); } catch {} }
+    }
+    for (const p of plan) { try { fs.rmSync(p.staged, { force: true }); } catch {} }
+    console.error(`  ✗ ${dir} : ${e.message}（已回滚，目标目录保持安装前状态）`);
     hadError = true;
   }
 }

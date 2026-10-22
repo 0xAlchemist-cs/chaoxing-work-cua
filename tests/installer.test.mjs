@@ -103,13 +103,33 @@ test("缺必需文件（cdp-client.mjs 不在包里）：安装必须失败退�
   assert.ok(!existsSync(join(target, "chaoxing-work-cua", "SKILL.md")), "失败时不应写入部分文件");
 });
 
-test("中途失败不留半成品：目标目录在失败后不存在 skill 子目录", () => {
+test("写入前失败（缺源文件）：失败发生在任何写入之前，不留半成品", () => {
   const pkg = makePkgDir();
   rmSync(join(pkg, "SKILL.md"));
   const target = mkdtempSync(join(tmpdir(), "cx-tgt-"));
   const r = runInstaller(pkg, target);
   assert.notEqual(r.status, 0);
   assert.ok(!existsSync(join(target, "chaoxing-work-cua")), "失败后残留了不完整目录");
+});
+
+test("写入中途失败必须整体回滚：不得留下新旧混合状态", () => {
+  const pkg = makePkgDir();
+  const target = mkdtempSync(join(tmpdir(), "cx-tgt-"));
+  const dir = join(target, "chaoxing-work-cua");
+  mkdirSync(dir, { recursive: true });
+  // 注入：把第二个文件的落点占成目录 → 前一个文件写入成功、后一个写入必然失败
+  mkdirSync(join(dir, "cdp-client.mjs"));
+  const r = runInstaller(pkg, target);
+  assert.notEqual(r.status, 0, "中途失败必须非零退出");
+  assert.ok(!existsSync(join(dir, "SKILL.md")), "回滚后不应残留已写入的 SKILL.md（混合状态）");
+  assert.ok(readdirSync(dir).every(f => f !== "SKILL.md"), "目录里不得有半成品文件");
+  const staged = readdirSync(dir).filter(f => /\.staged-/.test(f));
+  assert.equal(staged.length, 0, "暂存文件未清理");
+  // 修复注入后重装应成功（目录占位被人工清除的场景）
+  rmSync(join(dir, "cdp-client.mjs"), { recursive: true });
+  const r2 = runInstaller(pkg, target);
+  assert.equal(r2.status, 0, "排除故障后重装应成功");
+  assert.ok(existsSync(join(dir, "SKILL.md")) && existsSync(join(dir, "cdp-client.mjs")));
 });
 
 test("npm pack 清单：发布包必须包含 cdp-client.mjs / SKILL.md / bin/install.js / README / LICENSE", () => {
