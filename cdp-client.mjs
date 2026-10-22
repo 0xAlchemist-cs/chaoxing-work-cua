@@ -1,24 +1,44 @@
 // 零依赖 CDP（Chrome DevTools Protocol）客户端：仅用 node:net/node:crypto。
 // 适用于 WebSocket/fetch 全局被剥离的 Agent JS 沙箱（手写 WebSocket 帧协议）。
+//
+// 安全模型（R1 审计后确立）：
+//   1. 目标选择是严格的：url 不匹配 / 多目标歧义 → 抛错停止，绝不回退到其他页面。
+//      url 匹配规则 = origin 相同 + pathname 相同 + pattern 里给出的每个 query 参数值相同。
+//   2. /json/list 属于不可信输入：其中 wsUrl 的主机必须是环回地址，否则拒绝（EHOST）。
+//   3. 所有发送的 JS 表达式必须由 Agent 自己构造，页面内容只能作为数据读取。
+//
 // 用法（把 <repo> 换成仓库实际路径）：
 //   const { connectCDP, listTargets } = await import(pathToFileURL("<repo>/cdp-client.mjs").href);
-//   const cdp = await connectCDP();          // 自动找 9222 端口第一个 page
-//   await cdp.send("Page.navigate", { url });
+//   const cdp = await connectCDP({
+//     port: 9222,
+//     url: "https://mooc1.chaoxing.com/mooc-ans/mooc2/work/dowork?workId=12345", // 严格身份
+//   });
+//   await cdp.send("Page.enable");
 //   const r = await cdp.send("Runtime.evaluate", { expression: "document.title", returnByValue: true });
 import net from "node:net";
 import crypto from "node:crypto";
 
-const httpGet = (url) => new Promise((resolve, reject) => {
-  httpGetRaw(url).then(resolve).catch(reject);
-});
+const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1", "[::1]"]);
+
+function assertLoopbackHost(hostname) {
+  const h = String(hostname || "").toLowerCase();
+  if (LOOPBACK_HOSTS.has(h)) return h;
+  throw new Error(`EHOST: CDP 端点必须是环回地址（localhost/127.0.0.1），收到 ${hostname}。` +
+    `调试端口只应监听本机；如确需连接远程主机请人工评估后修改 LOOPBACK_HOSTS。`);
+}
+
+// ---------- HTTP（/json/*） ----------
+
 function httpGetRaw(url) {
   return new Promise((resolve, reject) => {
     const u = new URL(url);
+    assertLoopbackHost(u.hostname);
     const req = net.connect(+u.port, u.hostname, () => {
       req.write(`GET ${u.pathname} HTTP/1.1\r\nHost: ${u.hostname}:${u.port}\r\nConnection: close\r\n\r\n`);
     });
     let buf = Buffer.alloc(0), headerDone = false, need = -1;
-    const finish = (val) => { try { req.destroy(); } catch {}; resolve(val); };
+    const finish = (val) => { try { req.destroy(); } catch {} resolve(val); };
+    req.setTimeout(8000, () => { req.destroy(); reject(new Error("ETIMEOUT-HTTP: /json 请求超时")); });
     req.on("data", (c) => {
       buf = Buffer.concat([buf, c]);
       if (!headerDone) {
@@ -39,15 +59,61 @@ function httpGetRaw(url) {
   });
 }
 
-async function listTargets(port = 9222) {
-  const body = await httpGet(`http://127.0.0.1:${port}/json/list`);
-  return JSON.parse(body);
+export async function listTargets(port = 9222) {
+  const body = await httpGetRaw(`http://127.0.0.1:${port}/json/list`);
+  const arr = JSON.parse(body);
+  if (!Array.isArray(arr)) throw new Error("EBADTARGETS: /json/list 返回非数组");
+  return arr;
 }
 
-// 极简 WebSocket：掩码发送、处理文本帧/64位长度/ping/关闭；不分片重组（CDP 单帧足够）
+// ---------- 目标身份：严格选择（R1 核心） ----------
+
+function parseUrlStrict(url) {
+  try { return new URL(url); }
+  catch { throw new Error(`EINVALIDURL: 无法解析目标 url "${url}"；必须给完整 URL（含 origin），` +
+    `例如 https://mooc1.chaoxing.com/mooc-ans/mooc2/work/dowork?workId=123`); }
+}
+
+/** pattern 的 origin+pathname 与 target 相同，且 pattern 指明的每个 query 参数值相等 */
+export function urlMatches(targetUrl, patternUrl) {
+  const t = parseUrlStrict(targetUrl), p = parseUrlStrict(patternUrl);
+  if (t.origin !== p.origin) return false;
+  if (t.pathname !== p.pathname) return false;
+  for (const [k, v] of p.searchParams) {
+    if (t.searchParams.get(k) !== v) return false;
+  }
+  return true;
+}
+
+/**
+ * 从 /json/list 结果中唯一确定目标。任何不唯一/不匹配都抛错，绝不静默回退。
+ * @param {Array} targets  /json/list 原始数组（不可信输入）
+ * @param {{url?: string, type?: string}} opts
+ */
+export function selectTarget(targets, { url, type = "page" } = {}) {
+  const pool = targets.filter(t => t && t.type === type && typeof t.webSocketDebuggerUrl === "string");
+  const list = () => pool.map(t => `  - ${t.url}  ws=${t.webSocketDebuggerUrl}`).join("\n");
+  if (!pool.length) throw new Error(`ENOTARGET: 没有 type=${type} 且带 webSocketDebuggerUrl 的目标`);
+  if (!url) {
+    if (pool.length === 1) return pool[0];
+    throw new Error(`EMULTIPLE: 存在 ${pool.length} 个 ${type} 目标，必须用 url 指明操作对象：\n${list()}`);
+  }
+  parseUrlStrict(url); // 尽早校验格式
+  const matches = pool.filter(t => urlMatches(t.url, url));
+  if (!matches.length) throw new Error(`ENOTARGET: 没有 ${type} 目标匹配 ${url}。当前目标：\n${list()}`);
+  if (matches.length > 1) throw new Error(`EMULTIPLE: ${matches.length} 个目标同时匹配 ${url}（歧义即停止）：\n${list()}`);
+  assertLoopbackHost(new URL(matches[0].webSocketDebuggerUrl).hostname); // 连接前校验，EHOST
+  return matches[0];
+}
+
+// ---------- WebSocket（手写帧协议） ----------
+
+const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+
 function wsConnect(wsUrl) {
   return new Promise((resolve, reject) => {
     const u = new URL(wsUrl);
+    try { assertLoopbackHost(u.hostname); } catch (e) { return reject(e); }
     const key = crypto.randomBytes(16).toString("base64");
     const sock = net.connect(+u.port, u.hostname, () => {
       sock.write(
@@ -58,14 +124,19 @@ function wsConnect(wsUrl) {
     });
     let buf = Buffer.alloc(0), handshaken = false, closed = false;
     const handlers = { message: [], close: [] };
-    sock.on("error", (e) => { if (!handshaken) reject(e); });
+    const failInit = (e) => { if (!handshaken) { try { sock.destroy(); } catch {} reject(e); } };
+    sock.on("error", failInit);
     sock.on("data", (c) => {
       buf = Buffer.concat([buf, c]);
       if (!handshaken) {
         const i = buf.indexOf("\r\n\r\n");
         if (i < 0) return;
         const head = buf.slice(0, i).toString();
-        if (!/ 101 /.test(head.split("\r\n")[0])) return reject(new Error("handshake failed: " + head.split("\r\n")[0]));
+        if (!/ 101 /.test(head.split("\r\n")[0])) return failInit(new Error("EHANDSHAKE: 握手失败 " + head.split("\r\n")[0]));
+        // 校验 Sec-WebSocket-Accept（防中间人/伪服务）
+        const expected = crypto.createHash("sha1").update(key + WS_GUID).digest("base64");
+        const got = /sec-websocket-accept:\s*(.+)/i.exec(head);
+        if (!got || got[1].trim() !== expected) return failInit(new Error("EHANDSHAKE: Sec-WebSocket-Accept 不匹配"));
         buf = buf.slice(i + 4); handshaken = true;
         resolve({
           send: (obj) => sendFrame(JSON.stringify(obj)),
@@ -81,20 +152,23 @@ function wsConnect(wsUrl) {
         if (buf.length < 2) return;
         const b0 = buf[0], b1 = buf[1];
         const opcode = b0 & 0x0f;
+        if (b0 & 0x70) return fatal("EWS: RSV 位被置位，非法帧");           // rsv1-3
         let len = b1 & 0x7f, off = 2, masked = b1 & 0x80;
         if (len === 126) { if (buf.length < 4) return; len = buf.readUInt16BE(2); off = 4; }
         else if (len === 127) { if (buf.length < 10) return; len = Number(buf.readBigUInt64BE(2)); off = 10; }
         if (buf.length < off + (masked ? 4 : 0) + len) return;
         const maskKey = masked ? buf.slice(off, off + 4) : null; off += masked ? 4 : 0;
-        let payload = Buffer.from(buf.slice(off, off + len)); buf = buf.slice(off + len);
+        const payload = Buffer.from(buf.slice(off, off + len)); buf = buf.slice(off + len);
         if (maskKey) for (let i = 0; i < payload.length; i++) payload[i] ^= maskKey[i & 3];
         if (opcode === 1 || opcode === 2) {
           const txt = payload.toString();
           handlers.message.forEach((f) => { try { f(txt); } catch {} });
         } else if (opcode === 9) sendFrameRaw(0x8a, payload);          // ping -> pong
         else if (opcode === 8) { closed = true; try { sock.end(); } catch {} handlers.close.forEach((f) => f()); }
+        else return fatal(`EWS: 未处理的 opcode ${opcode}`);
       }
     }
+    function fatal(msg) { try { sock.destroy(); } catch {} handlers.close.forEach((f) => f()); failInit(new Error(msg)); }
     function sendFrame(str) { sendFrameRaw(0x81, Buffer.from(str)); }
     function sendFrameRaw(opcode, payload) {
       const mask = crypto.randomBytes(4);
@@ -109,22 +183,38 @@ function wsConnect(wsUrl) {
   });
 }
 
-export async function connectCDP(port = 9222, preferUrl) {
+// ---------- 连接封装 ----------
+
+/**
+ * 严格模式连接 CDP。
+ * @param {{port?: number, url?: string, type?: string}} opts  url=目标页面完整 URL（含区分参数如 workId）
+ */
+export async function connectCDP(opts = {}) {
+  const port = opts.port ?? 9222;
   const targets = await listTargets(port);
-  let page = targets.find((t) => t.type === "page" && (!preferUrl || t.url.includes(preferUrl)))
-          || targets.find((t) => t.type === "page");
-  if (!page) throw new Error("no page target");
-  const ws = await wsConnect(page.webSocketDebuggerUrl);
+  const target = selectTarget(targets, { url: opts.url, type: opts.type });
+  return openConnection(target);
+}
+
+/** 直接用 wsUrl 建连（用于 iframe 等 /json/list 里列出的非 page 目标）；同样校验环回主机 */
+export async function connectWsUrl(wsUrl) {
+  const u = new URL(wsUrl);
+  assertLoopbackHost(u.hostname);
+  return openConnection({ webSocketDebuggerUrl: wsUrl, url: wsUrl });
+}
+
+async function openConnection(target) {
+  const ws = await wsConnect(target.webSocketDebuggerUrl);
   let seq = 0; const pending = new Map(); const events = [];
   ws.on("message", (txt) => {
     const m = JSON.parse(txt);
     if (m.id && pending.has(m.id)) { const { resolve, reject } = pending.get(m.id); pending.delete(m.id);
-      m.error ? reject(new Error(m.error.message)) : resolve(m.result); }
-    else if (m.method) events.push(m);
+      m.error ? reject(new Error(`ECDP: ${m.error.message}`)) : resolve(m.result); }
+    else if (m.method) { events.push(m); if (events.length > 500) events.shift(); }
   });
-  ws.on("close", () => { for (const [, p] of pending) p.reject(new Error("cdp closed")); pending.clear(); });
+  ws.on("close", () => { for (const [, p] of pending) p.reject(new Error("ECLOSED: CDP 连接已断开")); pending.clear(); });
   return {
-    target: page,
+    target,
     send(method, params = {}) {
       const id = ++seq;
       return new Promise((resolve, reject) => {
@@ -136,4 +226,3 @@ export async function connectCDP(port = 9222, preferUrl) {
     close: () => ws.close(),
   };
 }
-export { listTargets };

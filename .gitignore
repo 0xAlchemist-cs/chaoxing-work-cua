@@ -1,4 +1,4 @@
-.mimosa/
 node_modules/
 *.tgz
-test-install/
+tests/.tmp/
+.mimosa/

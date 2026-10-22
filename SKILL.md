@@ -49,6 +49,27 @@ description: 用 Computer Use (CUA) 在浏览器中自动作答超星学习通�
 14. **有条件就选 CDP 直连模式（见专属章节）**：它同时根治坐标偏移、焦点抢夺、粘贴屏蔽
     三大问题，是多轮实测后的首选方案。CUA 坐标方案只作为 CDP 不可用时的兜底。
 
+## 操作权限边界（唯一依据，所有模式适用）
+
+<!-- perm-boundary -->
+
+任何模式下执行下表以外的写操作前，必须停下询问用户。**授权不继承**：上一节/上一份
+作业获准提交，不代表下一节可以提交；授权范围以"用户当前这句话"为准。
+
+| 操作 | 默认权限 | 说明 |
+|---|---|---|
+| 读页面内容（截图/DOM 文本/evaluate 查询） | 允许 | 只读无副作用 |
+| 选中选项、填写输入框、暂时保存 | 允许 | 可逆，随时可改 |
+| **提交**（作业提交/测验提交/确认弹窗里的提交） | **禁止，除非用户对当前任务明确说"提交"** | 不可逆；每次提交单独授权 |
+| 取消、清空已答内容 | 禁止 | 破坏已完成的工作 |
+| 关闭标签页/窗口、退出登录、删除 | 禁止 | 不可逆 |
+| 打开新页面/导航到作业无关 URL | 禁止 | 防止迷失目标 |
+
+**目标身份校验（连接前强制）**：操作任何页面前，用 `selectTarget`/`connectCDP({url})`
+按完整 URL（含 workId 等区分参数）唯一确定目标。不匹配（ENOTARGET）、歧义
+（EMULTIPLE）一律停止并报告，**绝不回退到"看起来像"的其他页面**——同名标签页在
+多账号场景下就是别人的卷子。
+
 ## 可直接复制的代码片段
 
 ### 初始化（每个执行单元的开头）
@@ -338,8 +359,9 @@ locator 点击/填写，彻底绕开 CUA 模式的坐标校准、截图超时、
   });
   ```
 
-- 提交：测验框内点"提交"后，确认弹窗在**主文档** `.popBottom`（含 提交/取消）→
-  在主文档对该弹窗内的"提交"按钮执行 JS click。
+- 提交（**需先取得用户对当前测验的一次性授权**，见「操作权限边界」）：测验框内点
+  "提交"后，确认弹窗在**主文档** `.popBottom`（含 提交/取消）→ 在主文档对该弹窗内
+  的"提交"按钮执行 JS click。
 - 验证：测验框文本出现「已完成 / 第N次作答 / 本次成绩X分 / 我的答案」即提交成功。
 
 ### 判分、错题与正确答案
@@ -453,6 +475,7 @@ btn && btn.click();
 **单元 B（核实 + 作答 + 提交 + 记录）**：
 
 ```js
+// 0. 前置：用户已对"本节测验提交"明确授权，否则到此为止只保存不提交
 // 1. 每道题先检索核实（选项明文 + 章节名搜索题库）
 // 2. 同一 evaluate 内：按选项明文文本 .click() 对应 <a>
 // 3. 点「提交」→ 主文档 .popBottom 弹窗内点「提交」
@@ -522,7 +545,13 @@ cmd //c start "" "C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe" 
 const { pathToFileURL } = await import("node:url");
 const { connectCDP, listTargets } = await import(
   pathToFileURL("<仓库路径>/cdp-client.mjs").href);
-const cdp = await connectCDP(9222, "目标页URL片段");  // 第二参数按 URL 选目标页
+// url 是严格身份：origin+路径+指定的 query 参数（如 workId）必须全部匹配，
+// 且恰好只有一个目标匹配。不匹配抛 ENOTARGET、歧义抛 EMULTIPLE、
+// wsUrl 指向非环回主机抛 EHOST —— 三种情况都必须停止并报告，不得回退。
+const cdp = await connectCDP({
+  port: 9222,
+  url: "https://mooc1.chaoxing.com/mooc-ans/mooc2/work/dowork?workId=12345",
+});
 await cdp.send("Page.enable");
 const r = await cdp.send("Runtime.evaluate", { expression: "document.title", returnByValue: true });
 ```
@@ -543,8 +572,8 @@ const r = await cdp.send("Runtime.evaluate", { expression: "document.title", ret
 // 精确元素位置（无需截图猜坐标）
 `(()=>{const r=document.querySelector('#id').getBoundingClientRect();return{x:r.x,y:r.y,w:r.width,h:r.height}})()`
 
-// iframe：先 listTargets() 看 type==='iframe' 的目标；跨域 iframe 用其
-// webSocketDebuggerUrl 单独 connectCDP 后在框架内 evaluate。
+// iframe：先 listTargets() 看 type==='iframe' 的目标；选中后用其
+// webSocketDebuggerUrl 走 connectWsUrl() 直连（connectWsUrl 同样只允许环回主机）。
 ```
 
 - 需要看图验证时用 `Page.captureScreenshot`（可带 clip 截元素级区域），返回 base64，
