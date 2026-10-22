@@ -26,9 +26,9 @@
     "url": "git+ssh://git@github.com:0xAlchemist-cs/chaoxing-work-cua.git"
   },
   "engines": {
-    "node": ">=16"
+    "node": ">=18"
   },
   "scripts": {
-    "test": "node --test tests/*.test.mjs"
+    "test": "node --test"
   }
 }

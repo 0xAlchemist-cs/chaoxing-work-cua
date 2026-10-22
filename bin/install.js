@@ -4,31 +4,35 @@
  * 把 SKILL.md + cdp-client.mjs 安装到 Agent 的技能目录。
  *
  * 安全机制：
- *   - 必需文件（SKILL.md / cdp-client.mjs / bin/install.js 自身存在性）缺失 → 立即失败，
- *     且失败发生在写入任何文件之前（先全量校验，后写入）。
- *   - 覆盖已存在的 SKILL.md 前一律备份为 SKILL.md.bak-<时间戳>。
- *   - 若目标 SKILL.md 不是本 skill（无 name: chaoxing-work-cua 标识）→ 视为外来文件，
- *     默认跳过覆盖并提示；--force 才覆盖（覆盖前同样备份）。
+ *   - 必需文件（SKILL.md / cdp-client.mjs）缺失 → 立即失败，且失败发生在写入任何
+ *     文件之前（先全量校验，后写入）。
+ *   - 覆盖已存在的任何文件前一律备份为 <原名>.bak-<时间戳>。
+ *   - 若目标 SKILL.md 不是本 skill（frontmatter 的 name 不是 chaoxing-work-cua）
+ *     → 视为外来文件，默认跳过覆盖并提示；--force 才覆盖（覆盖前同样备份）。
  *
- * 用法：
- *   npx chaoxing-work-cua                 # 自动检测已存在的技能目录并安装
- *   npx chaoxing-work-cua --target <dir>  # 安装到指定目录
- *   npx chaoxing-work-cua --force         # 允许覆盖外来 SKILL.md
+ * 用法：不带参数自动检测技能目录；--target <目录> 指定安装位置；--force 允许覆盖外来文件。
  */
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
 
 const SKILL_NAME = "chaoxing-work-cua";
-const SKILL_MARKER = `name: ${SKILL_NAME}`; // frontmatter 标识，用于识别"是否我们装的"
 const REQUIRED_FILES = ["SKILL.md", "cdp-client.mjs"]; // 必需文件，缺一即失败
 
 const args = process.argv.slice(2);
 
 let customTarget = null;
 const tIdx = args.indexOf("--target");
-if (tIdx > -1 && args[tIdx + 1]) customTarget = path.resolve(args[tIdx + 1]);
-const force = args.includes("--force");
+if (tIdx > -1) {
+  const val = args[tIdx + 1];
+  if (!val || val.startsWith("--")) {
+    console.error("✗ --target 需要一个目录参数（如 --target \"D:\\my-agent\\skills\"）");
+    process.exit(1);
+  }
+  customTarget = path.resolve(val);
+}
+const FLAG_FORCE = "--force";
+const force = args.includes(FLAG_FORCE);
 
 // 候选技能目录（存在哪个装哪个；都没有则装到默认目录）
 const candidates = [".agents/skills", ".zcode/skills", ".claude/skills"];
@@ -58,10 +62,16 @@ const backup = (filePath) => {
   return bak;
 };
 
+/** 仅识别 frontmatter 里 name 恰为本 skill 的文件（整行精确匹配，防超串/嵌入伪造） */
 const isOurs = (filePath) => {
   try {
-    const head = fs.readFileSync(filePath, "utf8").slice(0, 500);
-    return head.includes(SKILL_MARKER);
+    const text = fs.readFileSync(filePath, "utf8");
+    const lines = text.split(/\r?\n/);
+    if (lines[0].trim() !== "---") return false; // 无 frontmatter 一律视为外来文件
+    const end = lines.indexOf("---", 1);
+    if (end < 0) return false;
+    const nameLine = `name: ${SKILL_NAME}`;
+    return lines.slice(1, end).some((l) => l.trim() === nameLine);
   } catch {
     return false;
   }
@@ -70,34 +80,50 @@ const isOurs = (filePath) => {
 // ---- 第 2 步：逐目录安装（先备份决策，后写入）----
 console.log(`安装 ${SKILL_NAME} skill ...`);
 let hadError = false;
+let skippedSkillCount = 0;
 for (const t of targets) {
   const dir = path.join(t, SKILL_NAME);
   try {
     fs.mkdirSync(dir, { recursive: true });
 
     const destSkill = path.join(dir, "SKILL.md");
+    let skillWritten = true;
     if (fs.existsSync(destSkill)) {
       if (!isOurs(destSkill) && !force) {
-        console.warn(`  ! 跳过 ${destSkill}：已存在非本 skill 的文件（外来文件保护）。确认要覆盖请加 --force。`);
-        continue; // 外来文件不动，但其余文件（cdp-client.mjs）仍安装
+        console.warn(`  ! 跳过 SKILL.md（外来文件保护）: ${destSkill} 确认要覆盖请使用 force 开关。`);
+        skillWritten = false;
+        skippedSkillCount++;
+      } else {
+        const bak = backup(destSkill);
+        console.log(`  ⧗ 已备份原 SKILL.md → ${path.basename(bak)}`);
+        fs.copyFileSync(srcFiles[0].path, destSkill);
       }
-      const bak = backup(destSkill);
-      console.log(`  ⧗ 已备份原文件 → ${path.basename(bak)}`);
-      fs.copyFileSync(srcFiles[0].path, destSkill);
     } else {
       fs.copyFileSync(srcFiles[0].path, destSkill);
     }
 
+    // 其余必需文件（cdp-client.mjs）无条件安装；覆盖前同样备份
     for (const s of srcFiles.slice(1)) {
-      fs.copyFileSync(s.path, path.join(dir, s.name));
+      const dest = path.join(dir, s.name);
+      if (fs.existsSync(dest)) {
+        const bak = backup(dest);
+        console.log(`  ⧗ 已备份原 ${s.name} → ${path.basename(bak)}`);
+      }
+      fs.copyFileSync(s.path, dest);
     }
-    console.log(`  ✓ ${dir}`);
+    console.log(skillWritten ? `  ✓ ${dir}` : `  ◐ ${dir}（SKILL.md 因外来文件保护未覆盖，其余文件已安装）`);
   } catch (e) {
     console.error(`  ✗ ${dir} : ${e.message}`);
     hadError = true;
   }
 }
 if (hadError) process.exitCode = 1;
+
+// 唯一目标也被外来保护跳过 → 明确失败（调用方必须看到"没装上"，而不是"完成！"）
+if (!hadError && targets.length === 1 && skippedSkillCount === 1) {
+  console.error("✗ SKILL.md 未安装（外来文件保护生效）。确认覆盖请使用 force 开关。");
+  process.exitCode = 1;
+}
 
 console.log("");
 console.log("完成！重启你的 Agent 后，skill 即被识别。");
