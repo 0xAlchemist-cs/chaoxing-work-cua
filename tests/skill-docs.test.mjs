@@ -29,3 +29,34 @@ test("CDP 用法已切换到严格身份 API（不存在子串式 connectCDP(922
   assert.match(skill, /ENOTARGET/);
   assert.match(skill, /EMULTIPLE/);
 });
+
+// ---------- R4：架构分离与统一安全基线 ----------
+
+test("历史事故表已移出 SKILL.md，归档在 INCIDENTS.md", () => {
+  assert.ok(!skill.includes("今日问题清单复盘"), "事故表应移至 INCIDENTS.md");
+  assert.match(skill, /INCIDENTS\.md/, "SKILL.md 应保留指向 INCIDENTS.md 的链接");
+  const incidents = readFileSync(join(import.meta.dirname, "..", "INCIDENTS.md"), "utf8");
+  assert.match(incidents, /R1 目标身份/, "INCIDENTS.md 缺少审计轮记录");
+  assert.match(incidents, /\| 13 \|/, "INCIDENTS.md 应保留 13 起事故全表");
+});
+
+test("三模式统一安全基线存在且覆盖 停止条件/状态核验/恢复指导", () => {
+  assert.match(skill, /<!-- safety-baseline -->/);
+  const section = skill.split("<!-- safety-baseline -->")[1].split("\n## ")[0];
+  for (const key of ["停止条件", "状态核验", "恢复指导"]) {
+    assert.ok(section.includes(key), `安全基线缺少：${key}`);
+  }
+  assert.match(section, /连续 2 次/, "熔断阈值应写入基线");
+});
+
+test("CDP 章节引用统一基线而非重复定义验证规则", () => {
+  assert.match(skill, /三模式统一安全基线」：CDP 消灭了坐标偏移/);
+});
+
+test("CI workflow 存在且跑测试与包清单校验", () => {
+  const ci = readFileSync(join(import.meta.dirname, "..", ".github", "workflows", "ci.yml"), "utf8");
+  assert.match(ci, /node --test/);
+  assert.match(ci, /scripts\/check-pack\.mjs/);
+  assert.match(ci, /ubuntu-latest/);
+  assert.match(ci, /windows-latest/, "安装器涉及路径处理，应覆盖 Windows");
+});
