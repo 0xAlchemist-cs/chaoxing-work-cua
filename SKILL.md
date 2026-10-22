@@ -49,6 +49,27 @@ description: 用 Computer Use (CUA) 在浏览器中自动作答超星学习通�
 14. **有条件就选 CDP 直连模式（见专属章节）**：它同时根治坐标偏移、焦点抢夺、粘贴屏蔽
     三大问题，是多轮实测后的首选方案。CUA 坐标方案只作为 CDP 不可用时的兜底。
 
+## 操作权限边界（唯一依据，所有模式适用）
+
+<!-- perm-boundary -->
+
+任何模式下执行下表以外的写操作前，必须停下询问用户。**授权不继承**：上一节/上一份
+作业获准提交，不代表下一节可以提交；授权范围以"用户当前这句话"为准。
+
+| 操作 | 默认权限 | 说明 |
+|---|---|---|
+| 读页面内容（截图/DOM 文本/evaluate 查询） | 允许 | 只读无副作用 |
+| 选中选项、填写输入框、暂时保存 | 允许 | 可逆，随时可改 |
+| **提交**（作业提交/测验提交/确认弹窗里的提交） | **禁止，除非用户对当前任务明确说"提交"** | 不可逆；每次提交单独授权 |
+| 取消、清空已答内容 | 禁止 | 破坏已完成的工作 |
+| 关闭标签页/窗口、退出登录、删除 | 禁止 | 不可逆 |
+| 打开新页面/导航到作业无关 URL | 禁止 | 防止迷失目标 |
+
+**目标身份校验（连接前强制）**：操作任何页面前，用 `selectTarget`/`connectCDP({url})`
+按完整 URL（含 workId 等区分参数）唯一确定目标。不匹配（ENOTARGET）、歧义
+（EMULTIPLE）一律停止并报告，**绝不回退到"看起来像"的其他页面**——同名标签页在
+多账号场景下就是别人的卷子。
+
 ## 可直接复制的代码片段
 
 ### 初始化（每个执行单元的开头）
@@ -68,29 +89,43 @@ await setupComputerUseRuntime({ globals: globalThis });
 const app = await agent.computerUse.getApp({ pid: <浏览器进程pid> }); // 首次用 listApps() 查询
 ```
 
-### 确认"前台 + 目标标签页"（所有坐标操作前调用）
+### 目标身份校验与前台化（两件事，分开做）
+
+**身份正确 ≠ 窗口在前台**。身份校验通过时浏览器完全可能仍在后台——宿主每个执行
+单元都会抢走焦点，此时坐标点击会被系统静默吞掉（页面 no_change、鼠标动了没反应）。
+所以每个坐标单元必须**依次**完成两步，缺一不可：
 
 ```js
 function workId(els) {
   const doc = els.find(e => e.kind === "textarea" && /workId=/.test(e.value || ""));
   return doc ? (doc.value.match(/workId=(\d+)/) || [])[1] : null;
 }
-async function ensureReady(app, targetWorkId) {
+
+// 第 1 步：身份 —— 确认当前标签就是目标作业；不是则枚举同名标签逐个切换（≤3 次）
+async function ensureTargetIdentity(app, targetWorkId) {
   let els = await app.elements();
-  if (workId(els) !== targetWorkId) {
+  for (let i = 0; i < 3 && workId(els) !== targetWorkId; i++) {
     const tabs = els.filter(e => e.kind === "tab" && /作业作答/.test(e.title || ""));
-    for (let i = 0; i < tabs.length; i++) {
-      await app.click(tabs[i].index);          // 点击标签页同时起到激活窗口的作用
-      els = await app.elements();
-      if (workId(els) === targetWorkId) break;
-    }
+    if (!tabs.length) return false;
+    await app.click(tabs[0].index);
+    els = await app.elements();
   }
-  return workId(els) === targetWorkId;
+  return workId(els) === targetWorkId;   // false → 停止并报告（切错账号/卷子风险）
+}
+
+// 第 2 步：前台 —— 点一次浏览器标签页元素激活窗口（身份已正确时仍然要做）
+async function ensureForeground(app) {
+  const els = await app.elements();      // 取完立刻用，防索引失效
+  const tab = els.find(e => e.kind === "tab" && /学生学习页面|作业作答/.test(e.title || ""));
+  if (!tab) return false;
+  await app.click(tab.index);            // 无障碍点击 = 激活窗口
+  return true;                           // false → 停止并报告（坐标操作会全部无效）
 }
 ```
 
-调用方式：`await ensureReady(app, "<目标作业的workId>")`，之后再做任何坐标操作。
-它同时解决**前台化**（点击标签会激活窗口）和**切错标签**（workId 校验）两个问题。
+顺序固定：`ensureTargetIdentity` 失败 → 停止报告；成功后**仍然**要执行
+`ensureForeground`——跳过这一步是"点击全部无效"最高频的根因（见 TL;DR #3）。
+前台化失败的判断标准：连续两次截图 `snapshot_mode: no_change` 且页面毫无反应。
 
 ### 无障碍跳题（读题阶段用，后台可用、不抢焦点）
 
@@ -189,7 +224,7 @@ scroll_amount = round((元素当前y - 期望y) / pxPerNotch)
 每个作答执行单元的固定骨架：
 
 ```
-初始化 → ensureReady(校验业务主键+前台化) → [跳到目标题] → 新截图 + 路标锚定算坐标
+初始化 → ensureTargetIdentity(校验业务主键) → ensureForeground(前台化) → [跳到目标题] → 新截图 + 路标锚定算坐标
 → 坐标操作 → 输入/点击 → 截图验证
 ```
 
@@ -242,7 +277,7 @@ scroll_amount = round((元素当前y - 期望y) / pxPerNotch)
 | 报错/现象 | 原因 | 处置 |
 |---|---|---|
 | `agent is not defined` | 新执行单元未初始化 | 单元开头加初始化代码 |
-| `raw foreground event ... refused ... frontmost_pid_mismatch` | 目标窗口不在前台 | ensureReady()（点标签页激活）后重试 |
+| `raw foreground event ... refused ... frontmost_pid_mismatch` | 目标窗口不在前台 | ensureForeground()（点标签页激活）后重试 |
 | `element index N no longer refers to...tree has shifted` | 无障碍索引跨调用失效 | 同单元内重取元素表再点，重试≤3 次 |
 | `frame_id ... is expired frame` | 帧绑定过期（切换标签页、间隔太久） | 先截一帧（不回显）重新绑定，再提交坐标 |
 | `scroll: expected an integer` | 滚动量传了小数 | 取整 |
@@ -271,6 +306,9 @@ scroll_amount = round((元素当前y - 期望y) / pxPerNotch)
    "提交"再提交**。
 
 ## 内置浏览器高效模式（browser-use / IAB，推荐）
+
+> 安全基线：停止条件/状态核验/恢复执行「三模式统一安全基线」；提交权限执行
+> 「操作权限边界」。本章只写 IAB 特有的操作技巧。
 
 配合 ZCode 内置浏览器（control-browser skill）时，可以**直接读写 DOM**：domSnapshot 读题、
 locator 点击/填写，彻底绕开 CUA 模式的坐标校准、截图超时、字体加密猜测等难题，
@@ -338,8 +376,9 @@ locator 点击/填写，彻底绕开 CUA 模式的坐标校准、截图超时、
   });
   ```
 
-- 提交：测验框内点"提交"后，确认弹窗在**主文档** `.popBottom`（含 提交/取消）→
-  在主文档对该弹窗内的"提交"按钮执行 JS click。
+- 提交（**需先取得用户对当前测验的一次性授权**，见「操作权限边界」）：测验框内点
+  "提交"后，确认弹窗在**主文档** `.popBottom`（含 提交/取消）→ 在主文档对该弹窗内
+  的"提交"按钮执行 JS click。
 - 验证：测验框文本出现「已完成 / 第N次作答 / 本次成绩X分 / 我的答案」即提交成功。
 
 ### 判分、错题与正确答案
@@ -361,6 +400,9 @@ locator 点击/填写，彻底绕开 CUA 模式的坐标校准、截图超时、
 - `dom_cua.get_visible_dom()` 不穿透 iframe（只返回主文档可见节点）。
 
 ## 外部浏览器 CUA 模式实战补充（第二轮实测）
+
+> 安全基线：停止条件/状态核验/恢复执行「三模式统一安全基线」；提交权限执行
+> 「操作权限边界」。本章只写 CUA 坐标模式特有的坑与对策。
 
 以下为第二轮（逐章测验）实测新增的坑与对策，与前面章节配合阅读。
 
@@ -399,8 +441,8 @@ locator 点击/填写，彻底绕开 CUA 模式的坐标校准、截图超时、
    出现）。`snapshot_mode: no_change` ≠ 点击生效，可能只是没绑到新帧。
 3. **点偏**：不重放原坐标。重新枚举元素定位 → 换元素 index 点击；元素树里找不到才
    退回"新截图 + 路标推算"。修正方向参考布局位移规律（见下）。
-4. **熔断**：同一目标连续 2 次点击未达预期 → 停止操作，截图说明现状请用户确认，
-   避免在错误状态下继续点（可能误选、误提交、误关页面）。
+4. **熔断**：执行「三模式统一安全基线」的停止条件（同一目标连续 2 次点击未达预期
+   → 停止操作，截图说明现状请用户确认，避免在错误状态下继续点）。
 
 ### 知识卡片链接（knowledge/cards）的局限
 
@@ -453,6 +495,7 @@ btn && btn.click();
 **单元 B（核实 + 作答 + 提交 + 记录）**：
 
 ```js
+// 0. 前置：用户已对"本节测验提交"明确授权，否则到此为止只保存不提交
 // 1. 每道题先检索核实（选项明文 + 章节名搜索题库）
 // 2. 同一 evaluate 内：按选项明文文本 .click() 对应 <a>
 // 3. 点「提交」→ 主文档 .popBottom 弹窗内点「提交」
@@ -461,27 +504,40 @@ btn && btn.click();
 
 ### 对照表的价值（跨账号复用）
 
-同一课程题库在不同账号间重复。提交后的批阅页是明文——把每题
-「题干 → 正确答案」记下来，下一个账号遇到同题直接命中，无需再猜。
-（实测：1.4 测验因猜错记 0 分且不能重做——这就是不先建对照表的代价。）
+同一课程题库在不同账号间重复。提交后的批阅页是明文——把每题「题干 → 正确答案」
+记入**本地**对照表（不入公开仓库），下一个账号遇到同题直接命中。历史教训与
+记录方法见 [INCIDENTS.md](INCIDENTS.md) 的「对照表」一节。
 
-### 今日问题清单复盘（按影响排序）
+### 历史事故复盘
 
-| # | 问题 | 根因 | 修复 |
-|---|---|---|---|
-| 1 | 坐标点击连续落错行（A→B、C→D） | 截图与点击间页面整体位移 54px | 弃用坐标，改 JS 直操作 |
-| 2 | 点击全部无效（页面 no_change） | 宿主抢焦点，浏览器不在前台 | 每单元先无障碍点击标签页前台化 |
-| 3 | 多选题猜 ABCD 记 0 分 | 题干字体加密，靠章节名推断 | 提交前检索核实；批阅页积累对照表 |
-| 4 | Q3 修正点击又点偏（B/空） | 每次点击后页面重渲染位移 | 同 #1，弃用坐标 |
-| 5 | 提交按钮点不到（y 漂移 886→1227） | 同上 | JS 按文本找 button 直点 |
-| 6 | `Browser tab unavailable` / `cannot bind tab` | claimed 标签轮末释放 / 用户关标签 | markHandoff + 每单元重枚举接管 |
-| 7 | IAB 截图持续超时 3000ms | 重页面（视频播放器） | 用 innerText/evaluate 通道替代截图 |
-| 8 | 跨域 iframe evaluate 返回 {} 且不执行 | 桥接不支持跨域执行 | 先同源化再操作 |
-| 9 | 误关用户的学习通标签页 | Alt+F4 关杂散弹窗时连带 | 关弹窗前确认前台窗口；关错就重新导航（cookie 登录态仍在） |
-| 10 | 批量扫描误判"只有视频" | knowledge/cards 页对部分小节不渲染测验 | 以 studentstudy 学习页内实际点开为准 |
-| 11 | 点任务点标签点空（记忆坐标与实际渲染位置差几十像素） | 用了上一帧的记忆坐标，页面重渲染后位置微移 | 标签/按钮一律元素表按文本找 index 点（TL;DR #13） |
-| 12 | 点击偏移后未察觉，继续后续操作，用户替我兜底 | 缺"点后立即验证"步骤 | 点击-验证循环 + 连续 2 次失败熔断（TL;DR #12） |
-| 13 | 多选题连猜全选全错，正确率被用户点名 | 无证据默认全选 | "全选"必须有题库原题证据；检索不到就报告用户 |
+13 起实操事故 + 三轮审计修复记录已移至 **[INCIDENTS.md](INCIDENTS.md)**（核心规则
+与历史档案分离）。想知道某条规则的来历，去那里查。
+
+## 三模式统一安全基线（CDP / IAB / CUA 通用，唯一依据）
+
+<!-- safety-baseline -->
+
+**停止条件（满足任一立即停手，报告用户，不得自行绕过）**：
+
+1. 目标身份不唯一或不确定（ENOTARGET / EMULTIPLE / workId 校验失败）；
+2. 同一操作连续 2 次未达预期（点击无效果、选项没选上、页面没切换）；
+3. 连接异常（ECLOSED / ETIMEOUT / EWS）且重连一次后仍异常；
+4. 待执行操作超出「操作权限边界」且用户未授权；
+5. 页面内容与预期作业不符（题目数、课程名对不上——可能切错了账号/卷子）。
+
+**状态核验（证据必须来自当前这一刻，不凭记忆推断）**：
+
+- CDP：`evaluate` 返回值 / 元素 `getBoundingClientRect` / 选中态 class；
+- IAB：`innerText` / `count` / `getAttribute` 查询通道；
+- CUA：刚回显的截图（`snapshot_mode: no_change` 不算点击生效的证据）。
+- 提交前：整页内容级核对（题数、每题选中态、无未答项）。
+
+**恢复指导（出错后怎么回来，不重放错误操作）**：
+
+1. 重新枚举目标（`listTargets` / 标签页枚举）→ 严格身份校验 → 重新连接；
+2. 从页面**当前实际状态**反推进度（读已答内容），不假设"上次操作已生效"；
+3. 被中断的写入（填空/简答）先读回内容再决定补输还是重输，禁止盲目覆盖；
+4. 恢复失败 → 停止并报告，等待用户处置。
 
 ## CDP 直连模式（首选方案，已全流程实测通过）
 
@@ -522,7 +578,13 @@ cmd //c start "" "C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe" 
 const { pathToFileURL } = await import("node:url");
 const { connectCDP, listTargets } = await import(
   pathToFileURL("<仓库路径>/cdp-client.mjs").href);
-const cdp = await connectCDP(9222, "目标页URL片段");  // 第二参数按 URL 选目标页
+// url 是严格身份：origin+路径+指定的 query 参数（如 workId）必须全部匹配，
+// 且恰好只有一个目标匹配。不匹配抛 ENOTARGET、歧义抛 EMULTIPLE、
+// wsUrl 指向非环回主机抛 EHOST —— 三种情况都必须停止并报告，不得回退。
+const cdp = await connectCDP({
+  port: 9222,
+  url: "https://mooc1.chaoxing.com/mooc-ans/mooc2/work/dowork?workId=12345",
+});
 await cdp.send("Page.enable");
 const r = await cdp.send("Runtime.evaluate", { expression: "document.title", returnByValue: true });
 ```
@@ -543,14 +605,16 @@ const r = await cdp.send("Runtime.evaluate", { expression: "document.title", ret
 // 精确元素位置（无需截图猜坐标）
 `(()=>{const r=document.querySelector('#id').getBoundingClientRect();return{x:r.x,y:r.y,w:r.width,h:r.height}})()`
 
-// iframe：先 listTargets() 看 type==='iframe' 的目标；跨域 iframe 用其
-// webSocketDebuggerUrl 单独 connectCDP 后在框架内 evaluate。
+// iframe：先 listTargets()，再对目标列表跑 selectTarget(targets, {url, type:"iframe"})
+// 唯一确定后，用**选中目标**的 webSocketDebuggerUrl 走 connectWsUrl() 直连。
+// 禁止跳过 selectTarget 直接拿列表里第一个 wsUrl 连——那是身份校验旁路。
 ```
 
 - 需要看图验证时用 `Page.captureScreenshot`（可带 clip 截元素级区域），返回 base64，
   用 node:fs 写临时 png 后交给视觉模型。
-- **验证纪律不变**：每次点击后 evaluate 核对预期状态（选中 class 变化、文本出现），
-  提交前整页 innerText 核对。CDP 消灭了偏移，但消灭不了选错答案。
+- 验证与熔断执行「三模式统一安全基线」：CDP 消灭了坐标偏移，但消灭不了选错答案，
+  每次点击后仍要 evaluate 核对预期状态。提交权限执行「操作权限边界」——默认只
+  保存，提交需用户对当前任务一次性明确授权。
 
 ### 本模式已踩坑（写库时已修复，改动需重验）
 
