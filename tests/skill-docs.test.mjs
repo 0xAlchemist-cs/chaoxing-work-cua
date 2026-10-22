@@ -67,3 +67,21 @@ test("CI workflow 存在且跑测试与包清单校验", () => {
   assert.match(ci, /ubuntu-latest/);
   assert.match(ci, /windows-latest/, "安装器涉及路径处理，应覆盖 Windows");
 });
+
+// ---------- R5：CUA 身份校验与前台化必须分开 ----------
+
+test("ensureReady 已拆分：身份校验（ensureTargetIdentity）与前台化（ensureForeground）是两个独立步骤", () => {
+  assert.ok(!/async function ensureReady/.test(skill), "旧的 ensureReady 合一函数应移除");
+  assert.match(skill, /ensureTargetIdentity/);
+  assert.match(skill, /ensureForeground/);
+  assert.match(skill, /身份正确 ≠ 窗口在前台|身份正确.*≠.*前台/, "必须明确身份≠前台");
+});
+
+test("文档明确：身份校验通过后仍需单独前台化（防止宿主抢焦点吞掉坐标事件）", () => {
+  const idx = skill.indexOf("ensureTargetIdentity");
+  assert.ok(idx > 0, "缺少拆分章节");
+  const chunk = skill.slice(Math.max(0, idx - 2000), idx + 3000);
+  assert.ok(chunk.includes("ensureForeground"), "拆分章节须包含 ensureForeground");
+  assert.match(chunk, /仍然.{0,80}前台|前台.{0,80}仍然|仍然.{0,80}ensureForeground/s,
+    "须写明身份成功后仍要前台化");
+});

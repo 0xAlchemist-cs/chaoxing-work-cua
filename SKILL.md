@@ -89,29 +89,43 @@ await setupComputerUseRuntime({ globals: globalThis });
 const app = await agent.computerUse.getApp({ pid: <浏览器进程pid> }); // 首次用 listApps() 查询
 ```
 
-### 确认"前台 + 目标标签页"（所有坐标操作前调用）
+### 目标身份校验与前台化（两件事，分开做）
+
+**身份正确 ≠ 窗口在前台**。身份校验通过时浏览器完全可能仍在后台——宿主每个执行
+单元都会抢走焦点，此时坐标点击会被系统静默吞掉（页面 no_change、鼠标动了没反应）。
+所以每个坐标单元必须**依次**完成两步，缺一不可：
 
 ```js
 function workId(els) {
   const doc = els.find(e => e.kind === "textarea" && /workId=/.test(e.value || ""));
   return doc ? (doc.value.match(/workId=(\d+)/) || [])[1] : null;
 }
-async function ensureReady(app, targetWorkId) {
+
+// 第 1 步：身份 —— 确认当前标签就是目标作业；不是则枚举同名标签逐个切换（≤3 次）
+async function ensureTargetIdentity(app, targetWorkId) {
   let els = await app.elements();
-  if (workId(els) !== targetWorkId) {
+  for (let i = 0; i < 3 && workId(els) !== targetWorkId; i++) {
     const tabs = els.filter(e => e.kind === "tab" && /作业作答/.test(e.title || ""));
-    for (let i = 0; i < tabs.length; i++) {
-      await app.click(tabs[i].index);          // 点击标签页同时起到激活窗口的作用
-      els = await app.elements();
-      if (workId(els) === targetWorkId) break;
-    }
+    if (!tabs.length) return false;
+    await app.click(tabs[0].index);
+    els = await app.elements();
   }
-  return workId(els) === targetWorkId;
+  return workId(els) === targetWorkId;   // false → 停止并报告（切错账号/卷子风险）
+}
+
+// 第 2 步：前台 —— 点一次浏览器标签页元素激活窗口（身份已正确时仍然要做）
+async function ensureForeground(app) {
+  const els = await app.elements();      // 取完立刻用，防索引失效
+  const tab = els.find(e => e.kind === "tab" && /学生学习页面|作业作答/.test(e.title || ""));
+  if (!tab) return false;
+  await app.click(tab.index);            // 无障碍点击 = 激活窗口
+  return true;                           // false → 停止并报告（坐标操作会全部无效）
 }
 ```
 
-调用方式：`await ensureReady(app, "<目标作业的workId>")`，之后再做任何坐标操作。
-它同时解决**前台化**（点击标签会激活窗口）和**切错标签**（workId 校验）两个问题。
+顺序固定：`ensureTargetIdentity` 失败 → 停止报告；成功后**仍然**要执行
+`ensureForeground`——跳过这一步是"点击全部无效"最高频的根因（见 TL;DR #3）。
+前台化失败的判断标准：连续两次截图 `snapshot_mode: no_change` 且页面毫无反应。
 
 ### 无障碍跳题（读题阶段用，后台可用、不抢焦点）
 
@@ -210,7 +224,7 @@ scroll_amount = round((元素当前y - 期望y) / pxPerNotch)
 每个作答执行单元的固定骨架：
 
 ```
-初始化 → ensureReady(校验业务主键+前台化) → [跳到目标题] → 新截图 + 路标锚定算坐标
+初始化 → ensureTargetIdentity(校验业务主键) → ensureForeground(前台化) → [跳到目标题] → 新截图 + 路标锚定算坐标
 → 坐标操作 → 输入/点击 → 截图验证
 ```
 
@@ -263,7 +277,7 @@ scroll_amount = round((元素当前y - 期望y) / pxPerNotch)
 | 报错/现象 | 原因 | 处置 |
 |---|---|---|
 | `agent is not defined` | 新执行单元未初始化 | 单元开头加初始化代码 |
-| `raw foreground event ... refused ... frontmost_pid_mismatch` | 目标窗口不在前台 | ensureReady()（点标签页激活）后重试 |
+| `raw foreground event ... refused ... frontmost_pid_mismatch` | 目标窗口不在前台 | ensureForeground()（点标签页激活）后重试 |
 | `element index N no longer refers to...tree has shifted` | 无障碍索引跨调用失效 | 同单元内重取元素表再点，重试≤3 次 |
 | `frame_id ... is expired frame` | 帧绑定过期（切换标签页、间隔太久） | 先截一帧（不回显）重新绑定，再提交坐标 |
 | `scroll: expected an integer` | 滚动量传了小数 | 取整 |
