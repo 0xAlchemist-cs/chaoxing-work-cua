@@ -37,6 +37,17 @@ description: 用 Computer Use (CUA) 在浏览器中自动作答超星学习通�
 11. **省 token 的帧绑定技巧**：截图接口支持"只绑定帧、不回显图片"的模式（如
     `emit:false`）。任何"点击/滚动前需要重新绑定帧"的场合都用它，只有真正要读内容时
     才回显截图。
+12. **点击-验证循环是硬性纪律**：每次坐标点击后立即截图，确认**预期的那一个**状态变化
+    （标签切换了/选项高亮了/页面跳转了）。没变化或变化不对 = 点偏了，**禁止拿原坐标
+    再点一次**——先重新枚举无障碍元素按文本定位，或重新截图重算坐标。同一目标连续
+    2 次偏移就停下向用户报告，不要带错继续（实测教训：点偏后未察觉继续操作，最后靠
+    用户兜底）。
+13. **标签/按钮优先用无障碍元素点击，不用像素坐标**。凡元素表里能按文本找到的
+    （tab、button、"下一节"类按钮），同一执行单元内 `枚举 → 按文本查找 → click(index)`。
+    凭上一帧截图记坐标是实测点空的直接原因——页面每次渲染位置都会微动，元素索引才是
+    稳定锚点。
+14. **有条件就选 CDP 直连模式（见专属章节）**：它同时根治坐标偏移、焦点抢夺、粘贴屏蔽
+    三大问题，是多轮实测后的首选方案。CUA 坐标方案只作为 CDP 不可用时的兜底。
 
 ## 可直接复制的代码片段
 
@@ -372,6 +383,24 @@ locator 点击/填写，彻底绕开 CUA 模式的坐标校准、截图超时、
 - 题干字体加密时，靠乱码解码+章节名推断**不可靠**（实测多选题猜全选错了 0 分）。
 - 正确姿势：用可读的**选项文本+章节名**上搜索引擎核实标准答案，再作答；
   检索不到的题目优先做保守选择并向用户说明。
+- **"全选 ABCD"是高危答案**：多选题通常全对才给分，选多/选少都可能是 0 分。除非
+  检索到直接证据（题库原题+答案），禁止默认全选（实测连续两道多选全猜 ABCD 全错，
+  被用户点名"正确率低"）。
+- 每题检索失败时的处理顺序：换关键词（选项中最独特的短语）→ 搜"章节名+题型" →
+  仍找不到就**标出来告诉用户**，宁留白不乱猜。
+
+### 点击自检纪律（针对"点偏了自己没发现"）
+
+每次坐标点击必须走完这个闭环，缺一步就是返工：
+
+1. **点前**：定位来源必须是本帧——无障碍元素表按文本找 index（首选），或刚回显的
+   截图实测坐标（次选）。**禁止**沿用记忆坐标/上一帧坐标。
+2. **点后**：立即截图，核对预期的**具体**状态变化（tab 高亮切换、选项选中、弹窗
+   出现）。`snapshot_mode: no_change` ≠ 点击生效，可能只是没绑到新帧。
+3. **点偏**：不重放原坐标。重新枚举元素定位 → 换元素 index 点击；元素树里找不到才
+   退回"新截图 + 路标推算"。修正方向参考布局位移规律（见下）。
+4. **熔断**：同一目标连续 2 次点击未达预期 → 停止操作，截图说明现状请用户确认，
+   避免在错误状态下继续点（可能误选、误提交、误关页面）。
 
 ### 知识卡片链接（knowledge/cards）的局限
 
@@ -450,6 +479,97 @@ btn && btn.click();
 | 8 | 跨域 iframe evaluate 返回 {} 且不执行 | 桥接不支持跨域执行 | 先同源化再操作 |
 | 9 | 误关用户的学习通标签页 | Alt+F4 关杂散弹窗时连带 | 关弹窗前确认前台窗口；关错就重新导航（cookie 登录态仍在） |
 | 10 | 批量扫描误判"只有视频" | knowledge/cards 页对部分小节不渲染测验 | 以 studentstudy 学习页内实际点开为准 |
+| 11 | 点任务点标签点空（记忆坐标与实际渲染位置差几十像素） | 用了上一帧的记忆坐标，页面重渲染后位置微移 | 标签/按钮一律元素表按文本找 index 点（TL;DR #13） |
+| 12 | 点击偏移后未察觉，继续后续操作，用户替我兜底 | 缺"点后立即验证"步骤 | 点击-验证循环 + 连续 2 次失败熔断（TL;DR #12） |
+| 13 | 多选题连猜全选全错，正确率被用户点名 | 无证据默认全选 | "全选"必须有题库原题证据；检索不到就报告用户 |
+
+## CDP 直连模式（首选方案，已全流程实测通过）
+
+用 Chrome DevTools Protocol（CDP）直连用户侧的 Chrome/Edge，**在页面里执行 JS 完成
+一切操作**。对比 CUA 坐标点击的全面优势：
+
+| CUA 坐标方案的痛点 | CDP 模式下 |
+|---|---|
+| 点击偏移、点到相邻选项 | 按 selector/文本点击，没有坐标概念 |
+| 宿主抢焦点导致点击全部无效 | CDP 在浏览器**后台**也生效 |
+| 平台屏蔽粘贴 | 直接改输入框 value + dispatchEvent |
+| 布局位移让旧坐标作废 | 每次实时 `getBoundingClientRect` |
+| 跨域 iframe 读不到 | OOPIF iframe 是独立调试目标，可逐个连接 |
+
+### 一次性启动带调试端口的浏览器（细节多，照抄）
+
+```bash
+# 必须用 cmd //c start 脱离进程树——自动化工具的 shell 每次调用结束会回收子进程，
+# 直接后台启动的浏览器会随调用结束被杀（实测）。启动后用 netstat 确认端口 LISTENING。
+cmd //c start "" "C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe" \
+  --user-data-dir="C:\Users\<你>\.zcode\edge-cua-profile" \
+  --remote-debugging-port=9222 --no-first-run --no-default-browser-check \
+  --window-size=1280,900 "about:blank"
+```
+
+- **必须配独立 `--user-data-dir`**：Chromium 136+ 对默认用户目录禁用
+  remote-debugging（静默失效）。独立 profile 首次要登录目标平台一次，之后 cookie
+  常驻，且与用户日常浏览器隔离。
+- 验证：GET `http://127.0.0.1:9222/json/version`。
+
+### 零依赖客户端库（仓库已带，见 cdp-client.mjs）
+
+很多 Agent 的 JS 沙箱会**剥离全局 WebSocket/fetch**，所以本仓库附带的
+[cdp-client.mjs](cdp-client.mjs) 用 node:net 手写 WebSocket 帧协议，仅依赖 Node
+内置模块，放到任何执行环境都能跑。
+
+```js
+const { pathToFileURL } = await import("node:url");
+const { connectCDP, listTargets } = await import(
+  pathToFileURL("<仓库路径>/cdp-client.mjs").href);
+const cdp = await connectCDP(9222, "目标页URL片段");  // 第二参数按 URL 选目标页
+await cdp.send("Page.enable");
+const r = await cdp.send("Runtime.evaluate", { expression: "document.title", returnByValue: true });
+```
+
+### 常用操作片段（全部经 Runtime.evaluate）
+
+```js
+// 按文本点击（选项/按钮/标签通用）
+`[...document.querySelectorAll('a,li,button')].find(e=>/目标文本/.test(e.innerText))?.click()`
+
+// 读题干/验证状态
+`document.querySelector('<题目容器选择器>')?.innerText`
+
+// 设值（普通输入框，绕开粘贴屏蔽；富文本编辑器需另行处理）
+`(()=>{const i=document.querySelector('input');const s=Object.getOwnPropertyDescriptor(
+  window.HTMLInputElement.prototype,'value').set;s.call(i,'答案');i.dispatchEvent(new Event('input',{bubbles:true}));})()`
+
+// 精确元素位置（无需截图猜坐标）
+`(()=>{const r=document.querySelector('#id').getBoundingClientRect();return{x:r.x,y:r.y,w:r.width,h:r.height}})()`
+
+// iframe：先 listTargets() 看 type==='iframe' 的目标；跨域 iframe 用其
+// webSocketDebuggerUrl 单独 connectCDP 后在框架内 evaluate。
+```
+
+- 需要看图验证时用 `Page.captureScreenshot`（可带 clip 截元素级区域），返回 base64，
+  用 node:fs 写临时 png 后交给视觉模型。
+- **验证纪律不变**：每次点击后 evaluate 核对预期状态（选中 class 变化、文本出现），
+  提交前整页 innerText 核对。CDP 消灭了偏移，但消灭不了选错答案。
+
+### 本模式已踩坑（写库时已修复，改动需重验）
+
+| 坑 | 原因 | 处置 |
+|---|---|---|
+| shell 里启动的浏览器随调用结束消失 | 工具回收子进程树 | `cmd //c start` 脱离启动 |
+| `Connection: close` 也等不到 socket close | DevTools HTTP 服务保持连接 | 按 Content-Length 判定响应完整（库已处理） |
+| 调试端口开了但连不上 | 默认 profile 被 Chromium 136+ 禁用 | 必须独立 `--user-data-dir` |
+| 沙箱报 `WebSocket is not defined` | 执行环境剥离全局 | 用本仓库 cdp-client.mjs（手写 WS 帧） |
+
+### 备选方案（调研结论，未默认启用）
+
+- 官方 `@playwright/mcp --cdp-endpoint http://localhost:9222`：让 Playwright MCP 的
+  browser_* 工具直连本机浏览器（保留登录态）；缺点是调试端口没开时整个 MCP 可能
+  失效，影响其他任务，故默认不改。
+- `chrome-devtools-mcp --autoConnect`：Chrome 官方 MCP，能力类似。
+- 平台字体反爬的解密思路：预置标准字体 glyf 哈希映射表做字形比对还原（开源实现可
+  搜"超星 字体反爬 解码"），或装油猴脚本在浏览器端直接解密显示——后者一并解除
+  富文本编辑器的粘贴限制。
 
 ## 提交前验收清单
 

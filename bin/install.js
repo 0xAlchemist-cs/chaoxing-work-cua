@@ -31,12 +31,15 @@ if (customTarget) {
   targets = [path.join(os.homedir(), ".agents", "skills")];
 }
 
-// 源文件：包根目录下的 SKILL.md
+// 源文件：包根目录下的 SKILL.md + cdp-client.mjs（CDP 直连模式客户端库）
 const src = path.join(__dirname, "..", "SKILL.md");
 if (!fs.existsSync(src)) {
   console.error("✗ 安装包损坏：找不到 SKILL.md，请重新 npx 或 npm i -g。");
   process.exit(1);
 }
+const extraFiles = ["cdp-client.mjs"]
+  .map((f) => path.join(__dirname, "..", f))
+  .filter((p) => fs.existsSync(p));
 
 console.log(`安装 ${SKILL_NAME} skill ...`);
 for (const t of targets) {
@@ -44,6 +47,7 @@ for (const t of targets) {
   try {
     fs.mkdirSync(dir, { recursive: true });
     fs.copyFileSync(src, path.join(dir, "SKILL.md"));
+    for (const p of extraFiles) fs.copyFileSync(p, path.join(dir, path.basename(p)));
     console.log(`  ✓ ${dir}`);
   } catch (e) {
     console.error(`  ✗ ${dir} : ${e.message}`);
