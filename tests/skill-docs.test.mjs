@@ -49,15 +49,24 @@ test("三模式统一安全基线存在且覆盖 停止条件/状态核验/恢�
   assert.match(section, /连续 2 次/, "熔断阈值应写入基线");
 });
 
-test("三个模式章节都引用统一基线（真实统一，而非仅 CDP）", () => {
+test("四个模式章节都引用统一基线（真实统一，而非仅 CDP）", () => {
   const chapters = skill.split("\n## ");
   const find = (kw) => chapters.find((c) => c.startsWith(kw)) || "";
-  for (const [name, kw] of [["CDP", "CDP 直连模式"], ["IAB", "内置浏览器高效模式"], ["CUA", "外部浏览器 CUA 模式实战补充"]]) {
+  for (const [name, kw] of [["CDP", "CDP 直连模式"], ["IAB", "内置浏览器高效模式"], ["CUA", "外部浏览器 CUA 模式实战补充"], ["MCP", "Windows MCP 模式"]]) {
     const ch = find(kw);
     assert.ok(ch, `章节不存在：${name}`);
-    assert.match(ch, /三模式统一安全基线/, `${name} 章节应引用统一安全基线`);
+    assert.match(ch, /全模式统一安全基线/, `${name} 章节应引用统一安全基线`);
     assert.match(ch, /操作权限边界/, `${name} 章节应引用权限边界`);
   }
+});
+
+test("MCP 章节：写明不共享登录态、先确认登录窗口、含首用实测坑", () => {
+  const chapters = skill.split("\n## ");
+  const ch = chapters.find((c) => c.startsWith("Windows MCP 模式")) || "";
+  assert.match(ch, /自管沙箱实例/, "应写明实例归插件自管");
+  assert.match(ch, /登录态在哪个窗口/, "应写明先确认登录窗口");
+  assert.match(ch, /ERR_CERT_COMMON_NAME_INVALID/, "应记录证书坑");
+  assert.match(ch, /about:blank/, "应记录标签重置坑");
 });
 
 test("CI workflow 存在且跑测试与包清单校验", () => {
